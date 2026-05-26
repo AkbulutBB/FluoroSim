@@ -169,8 +169,8 @@ class NavigationView(DarkFrame):
         # Calibration reminder note
         tk.Label(
             sidebar,
-            text="⚠  Always calibrate with\nStandard Probe before\nswitching to Custom Tool.",
-            font=("Segoe UI", 8), fg=FG_WARN, bg=BG2,
+            text="ℹ  Calibrate with either\ntool. If using a custom\ntool, set tip distance\nbefore navigating.",
+            font=("Segoe UI", 8), fg=FG_MUTED, bg=BG2,
             justify=tk.LEFT,
         ).pack(anchor=tk.W, padx=8, pady=4)
 
