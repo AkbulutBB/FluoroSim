@@ -1,29 +1,28 @@
 """
-core/tracker.py — ArUco detection and probe pose estimation.
+core/tracker.py — Probe cube ArUco detection and pose estimation.
 
-Given a frame and camera intrinsics, detects any visible ArUco marker
-on the probe cube and returns the full 6-DOF pose plus the rod tip
-and base positions in camera space.
+Given a camera frame and its intrinsics, ArucoTracker detects whichever
+face of the 6-faced probe cube is currently visible and returns the full
+6-DOF pose of the cube plus the rod tip and base positions in camera space.
 
-Tool geometry is read from the active ToolProfile at detection time,
-so switching tools in the UI takes effect immediately without restart.
+Only the PROBE_ARUCO_DICT (DICT_4X4_50) is searched here, so the platform
+CharucoBoard markers (DICT_5X5_50) are never confused with probe faces.
 """
 
 import cv2
 import numpy as np
 from typing import Optional
 
-from config import ARUCO_DICT, CUBE_FACE_OBJ_PTS, get_active_tool
+from config import PROBE_ARUCO_DICT, CUBE_FACE_OBJ_PTS, ROD_BASE_IN_CUBE, ROD_TIP_IN_CUBE
 
 
 class ProbeDetection:
     """
     Result of a single probe detection.
 
-    All positions are in the camera coordinate frame, in millimetres.
-    The tip and base are computed from whichever ToolProfile was active
-    at the moment detect() was called.
+    All positions are expressed in the camera coordinate frame (millimetres).
     """
+
     __slots__ = (
         "rvec", "tvec", "R",
         "cube_center_cam",
@@ -32,75 +31,61 @@ class ProbeDetection:
         "rod_dir_cam",
         "marker_id",
         "image_corners",
-        "tool_name",
-        "tip_distance_mm",
     )
 
     def __init__(
         self,
-        rvec         : np.ndarray,
-        tvec         : np.ndarray,
-        R            : np.ndarray,
-        marker_id    : int,
+        rvec:          np.ndarray,
+        tvec:          np.ndarray,
+        R:             np.ndarray,
+        marker_id:     int,
         image_corners: np.ndarray,
     ):
-        self.rvec          = rvec           # (3,1) Rodrigues
-        self.tvec          = tvec           # (3,1) translation mm
-        self.R             = R             # (3,3) rotation matrix
+        self.rvec          = rvec            # (3, 1) Rodrigues rotation
+        self.tvec          = tvec            # (3, 1) translation in mm
+        self.R             = R              # (3, 3) rotation matrix
         self.marker_id     = marker_id
-        self.image_corners = image_corners  # (4,2) pixel positions
+        self.image_corners = image_corners   # (4, 2) pixel positions
 
-        # Snapshot the active tool at detection time so the overlay
-        # renderer always uses consistent geometry for this frame.
-        tool = get_active_tool()
-        self.tool_name        = tool.name
-        self.tip_distance_mm  = tool.tip_distance_mm
-
-        # Transform tool geometry from cube-local → camera space
         def _xfm(pt_cube: np.ndarray) -> np.ndarray:
+            """Transform a cube-local point into camera space."""
             return (R @ pt_cube.reshape(3, 1) + tvec).flatten()
 
         self.cube_center_cam = tvec.flatten()
-        self.rod_base_cam    = _xfm(tool.base_in_cube)
-        self.rod_tip_cam     = _xfm(tool.tip_in_cube)
+        self.rod_base_cam    = _xfm(ROD_BASE_IN_CUBE)
+        self.rod_tip_cam     = _xfm(ROD_TIP_IN_CUBE)
 
-        rod_vec              = self.rod_tip_cam - self.rod_base_cam
-        norm                 = np.linalg.norm(rod_vec)
-        self.rod_dir_cam     = rod_vec / norm if norm > 1e-6 else rod_vec
+        rod_vec           = self.rod_tip_cam - self.rod_base_cam
+        norm              = np.linalg.norm(rod_vec)
+        self.rod_dir_cam  = rod_vec / norm if norm > 1e-6 else rod_vec
 
 
 class ArucoTracker:
     """
-    Detects ArUco markers and estimates the full probe cube pose.
+    Detects the probe cube and returns its 6-DOF pose.
 
-    The tracker iterates through all detected markers and uses the first
-    one whose ID belongs to the cube face table.  Multiple simultaneously
-    visible faces are not fused (unnecessary for the accuracy target here).
+    Iterates through all markers detected in the frame and uses the first
+    one whose ID belongs to the cube face table (IDs 0–5).  A single
+    visible face is sufficient for full pose estimation via solvePnP.
     """
 
     def __init__(self):
         params = cv2.aruco.DetectorParameters()
-        # Relax defaults slightly for printed markers under variable lighting
+        # Slightly relaxed thresholds for variable lighting conditions
         params.adaptiveThreshWinSizeMin  = 3
         params.adaptiveThreshWinSizeMax  = 23
         params.adaptiveThreshWinSizeStep = 4
         params.minMarkerPerimeterRate    = 0.02
-        self._detector = cv2.aruco.ArucoDetector(ARUCO_DICT, params)
-
-    # ── Public API ─────────────────────────────────────────────────────────
+        self._detector = cv2.aruco.ArucoDetector(PROBE_ARUCO_DICT, params)
 
     def detect(
         self,
-        frame  : np.ndarray,
+        frame:   np.ndarray,
         cam_mtx: np.ndarray,
-        dist   : np.ndarray,
+        dist:    np.ndarray,
     ) -> Optional[ProbeDetection]:
         """
-        Detect the probe cube in frame and return a ProbeDetection,
-        or None if the cube is not visible.
-
-        Tip and base positions reflect the ToolProfile that is active
-        at the moment this method is called.
+        Detect the probe cube in frame and return a ProbeDetection, or None.
         """
         gray            = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         corners, ids, _ = self._detector.detectMarkers(gray)
@@ -115,7 +100,7 @@ class ArucoTracker:
             obj_pts = CUBE_FACE_OBJ_PTS[mid]
             img_pts = corners[i][0].astype(np.float32)
 
-            # IPPE_SQUARE is the most stable solver for near-planar targets
+            # IPPE_SQUARE is the most stable solver for near-planar square targets
             ok, rvec, tvec = cv2.solvePnP(
                 obj_pts, img_pts, cam_mtx, dist,
                 flags=cv2.SOLVEPNP_IPPE_SQUARE,
@@ -130,45 +115,40 @@ class ArucoTracker:
 
     def annotate(
         self,
-        frame     : np.ndarray,
-        detection : Optional[ProbeDetection],
-        cam_mtx   : np.ndarray,
-        dist      : np.ndarray,
+        frame:   np.ndarray,
+        det:     Optional[ProbeDetection],
+        cam_mtx: np.ndarray,
+        dist:    np.ndarray,
     ) -> np.ndarray:
         """
-        Draw detection overlay on a copy of frame.
-        Shows coordinate axes on the detected marker face, the rod shaft
-        line, and a label with the active tool name + tip distance.
+        Draw detection overlay on a copy of frame for live camera previews.
+        Shows coordinate axes on the detected face and the rod shaft.
         """
         out = frame.copy()
 
-        if detection is None:
-            cv2.putText(out, "No probe detected", (20, 40),
+        if det is None:
+            cv2.putText(out, "Probe: not detected", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 80, 255), 2)
             return out
 
-        # Coordinate axes on detected face
-        cv2.drawFrameAxes(out, cam_mtx, dist,
-                          detection.rvec, detection.tvec, 20.0)
+        # Coordinate axes on the detected marker face
+        cv2.drawFrameAxes(out, cam_mtx, dist, det.rvec, det.tvec, 20.0)
 
-        # Project shaft base and tip into image
-        tool     = get_active_tool()
-        pts_3d   = np.array(
-            [tool.base_in_cube, tool.tip_in_cube], dtype=np.float32
+        # Rod shaft projected into the image
+        proj, _ = cv2.projectPoints(
+            np.array([ROD_BASE_IN_CUBE, ROD_TIP_IN_CUBE], dtype=np.float32),
+            det.rvec, det.tvec, cam_mtx, dist,
         )
-        proj_pts, _ = cv2.projectPoints(
-            pts_3d, detection.rvec, detection.tvec, cam_mtx, dist,
-        )
-        proj_pts = proj_pts.reshape(-1, 2).astype(int)
+        p = proj.reshape(-1, 2).astype(int)
+        cv2.line(out,   tuple(p[0]), tuple(p[1]), (0, 200, 255), 3)
+        cv2.circle(out, tuple(p[1]), 8, (0, 255, 0), -1)
 
-        cv2.line(out, tuple(proj_pts[0]), tuple(proj_pts[1]), (0, 200, 255), 3)
-        cv2.circle(out, tuple(proj_pts[1]), 8, (0, 255, 0), -1)
+        # Face ID label
+        cx = int(det.image_corners[:, 0].mean())
+        cy = int(det.image_corners[:, 1].mean())
+        cv2.putText(out, f"Face {det.marker_id}", (cx - 20, cy - 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
-        # Tool label
-        cx = int(detection.image_corners[:, 0].mean())
-        cy = int(detection.image_corners[:, 1].mean())
-        label = f"{detection.tool_name}  |  tip {detection.tip_distance_mm:.0f} mm"
-        cv2.putText(out, label, (cx - 60, cy - 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
-
+        cv2.putText(out, "Probe: detected", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
         return out

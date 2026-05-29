@@ -1,29 +1,4 @@
 {
-  "name": "Default Spine Model (L3-L5)",
-  "description": "3D-printed lumbar spine model with two pedicle entry calibration slots.",
-  "slots": [
-    {
-      "label": "Slot 1 — Left L4",
-      "cube_center_model": [0.0, 0.0, 20.0],
-      "cube_R_model": [
-        1, 0, 0,
-        0, 0, 1,
-        0,-1, 0
-      ]
-    },
-    {
-      "label": "Slot 2 — Right L4",
-      "cube_center_model": [60.0, 0.0, 20.0],
-      "cube_R_model": [
-        1, 0, 0,
-        0, 0, 1,
-        0,-1, 0
-      ]
-    }
-  ],
-  "notes": [
-    "Place the probe cube into each slot with the rod pointing down into the hole.",
-    "The cube rotation matrix defines the cube pose when the probe is fully seated.",
-    "Run OR Setup to acquire X-rays and compute projection matrices for this model."
-  ]
+  "name": "Default Spine Model (L3–L5)",
+  "description": "3D-printed lumbar spine model for pedicle screw placement training. Run OR Setup to add X-ray images and compute projection matrices before training."
 }

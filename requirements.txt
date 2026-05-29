@@ -1,3 +1,12 @@
-opencv-contrib-python>=4.8.0
+# FluoroSim v2 — required packages
+# Install with:  pip install -r requirements.txt
+#
+# OpenCV 4.7+ required for the new CharucoBoard API.
+# The contrib package includes the ArUco module.
+opencv-contrib-python>=4.7.0
+
+# Numerical computing
 numpy>=1.24.0
+
+# Image display in Tkinter
 Pillow>=10.0.0

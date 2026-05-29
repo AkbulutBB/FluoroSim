@@ -1,37 +1,37 @@
 """
-ui/navigation.py — Live simulated fluoroscopy navigation.
+ui/navigation.py — Simulated fluoroscopy training view.
 
-Displays the pre-acquired AP and LAT X-ray images with the probe
-trajectory overlaid in real time.
+This is the primary training screen.  On every tick:
 
-Two modes:
-  Real-time — overlay refreshes every NAV_UPDATE_MS milliseconds.
-  Snapshot  — user presses Capture to take a single overlay image.
+  1. Grab frames from both cameras.
+  2. PlatformBoardTracker detects the CharucoBoard on each frame →
+     camera-to-model transform (xfm1, xfm2).
+  3. ArucoTracker detects the probe cube on each frame →
+     probe pose in camera space (det1, det2).
+  4. fuse_poses() combines both camera estimates into a single model-space
+     FusedPose.
+  5. XRayOverlay.render() projects the fused pose onto the stored AP and
+     LAT X-ray images.
+  6. The annotated X-rays are displayed side-by-side.
 
-v1.1: ToolPanel integrated in right sidebar — allows switching between
-      Standard Probe (calibration) and Custom Tool (chisel/awl) with
-      live tip-distance editing.
+The live camera feed is never shown.  The trainee sees only the stored
+X-ray images with the trajectory overlay — matching the fluoroscopy
+experience as closely as possible.
 """
 
 import tkinter as tk
 from tkinter import messagebox
+from datetime import datetime
 import cv2
 import numpy as np
-from PIL import Image, ImageTk
-from datetime import datetime
 
 from ui.widgets import (
     DarkFrame, primary_btn, success_btn,
-    BG, BG2, BG3, ACCENT, FG, FG_MUTED, FG_SUCCESS, FG_ERR, FG_WARN,
+    BG, BG2, FG, FG_MUTED, FG_SUCCESS, FG_ERR, FG_WARN,
     FONT_BODY, FONT_LABEL, FONT_TITLE, frame_to_tk,
 )
-from ui.tool_panel import ToolPanel
-from core.projection import XRayOverlay
-import config
-from config import (
-    XRAY_DISPLAY_W, XRAY_DISPLAY_H,
-    NAV_UPDATE_MS, NAV_REALTIME,
-)
+from core.pose_fusion import fuse_poses
+from config import XRAY_DISPLAY_W, XRAY_DISPLAY_H, NAV_UPDATE_MS, NAV_REALTIME
 
 
 class NavigationView(DarkFrame):
@@ -41,216 +41,133 @@ class NavigationView(DarkFrame):
         self._app   = app
         self._state = state
 
-        self._realtime    = NAV_REALTIME
-        self._after_id    = None
-        self._tk_img_ap   = None
-        self._tk_img_lat  = None
-        self._last_ap:  np.ndarray | None = None
-        self._last_lat: np.ndarray | None = None
+        self._realtime   = NAV_REALTIME
+        self._after_id   = None
+        self._last_ap    = None
+        self._last_lat   = None
+        self._tk_img_ap  = None
+        self._tk_img_lat = None
 
         self._build()
 
-    # ── Build ───────────────────────────────────────────────────────────────
+    # ── Build ────────────────────────────────────────────────────────────────
 
     def _build(self):
-        # ── Top bar ──────────────────────────────────────────────────────────
+        # ── Top toolbar ──────────────────────────────────────────────────────
         top = tk.Frame(self, bg=BG2, pady=6)
         top.pack(fill=tk.X)
 
-        tk.Label(
-            top, text="Simulated Fluoroscopy Navigation",
-            font=FONT_TITLE, fg=FG, bg=BG2,
-        ).pack(side=tk.LEFT, padx=14)
+        tk.Label(top, text="Simulated Fluoroscopy",
+                 font=FONT_TITLE, fg=FG, bg=BG2).pack(side=tk.LEFT, padx=14)
 
-        # Recalibrate
-        primary_btn(
-            top, "↩  Recalibrate",
-            command=self._recalibrate, width=14,
-        ).pack(side=tk.RIGHT, padx=6)
-
-        # Save
-        primary_btn(
-            top, "💾  Save image",
-            command=self._save, width=14,
-        ).pack(side=tk.RIGHT, padx=6)
-
-        # Capture (snapshot mode only)
-        self._capture_btn = primary_btn(
-            top, "📷  Capture",
-            command=self._capture, width=12,
-        )
+        # Right-side controls
+        primary_btn(top, "↩ Models",
+                    command=self._app.proceed_after_model_select, width=10
+                    ).pack(side=tk.RIGHT, padx=6)
+        primary_btn(top, "OR Setup",
+                    command=self._app.go_to_or_setup, width=10
+                    ).pack(side=tk.RIGHT, padx=6)
+        success_btn(top, "💾 Save",
+                    command=self._save, width=10
+                    ).pack(side=tk.RIGHT, padx=6)
+        self._capture_btn = primary_btn(top, "📷 Capture",
+                                        command=self._capture, width=10)
         self._capture_btn.pack(side=tk.RIGHT, padx=6)
 
         # Real-time toggle
         self._mode_var = tk.BooleanVar(value=self._realtime)
         tk.Checkbutton(
-            top, text="Real-time mode",
+            top, text="Live",
             variable=self._mode_var,
             font=FONT_LABEL, fg=FG_MUTED, bg=BG2,
-            selectcolor=BG3, activebackground=BG2,
+            selectcolor=BG2, activebackground=BG2,
             command=self._toggle_mode,
         ).pack(side=tk.RIGHT, padx=10)
 
-        # ── Status row ───────────────────────────────────────────────────────
+        # ── Status row ────────────────────────────────────────────────────────
         status_row = tk.Frame(self, bg=BG)
-        status_row.pack(fill=tk.X, padx=12, pady=4)
+        status_row.pack(fill=tk.X, padx=12, pady=2)
 
-        self._status_var = tk.StringVar(value="Ready.")
-        tk.Label(
-            status_row, textvariable=self._status_var,
-            font=FONT_LABEL, fg=FG_MUTED, bg=BG,
-        ).pack(side=tk.LEFT)
+        self._board_var  = tk.StringVar(value="Board: —")
+        self._probe_var  = tk.StringVar(value="Probe: —")
+        self._status_var = tk.StringVar(value="")
 
-        self._detect_var = tk.StringVar(value="Probe: not detected")
-        self._detect_lbl = tk.Label(
-            status_row, textvariable=self._detect_var,
-            font=FONT_LABEL, fg=FG_MUTED, bg=BG,
-        )
-        self._detect_lbl.pack(side=tk.RIGHT, padx=10)
+        tk.Label(status_row, textvariable=self._board_var,
+                 font=FONT_LABEL, fg=FG_MUTED, bg=BG).pack(side=tk.LEFT, padx=10)
+        tk.Label(status_row, textvariable=self._probe_var,
+                 font=FONT_LABEL, fg=FG_MUTED, bg=BG).pack(side=tk.LEFT, padx=10)
+        tk.Label(status_row, textvariable=self._status_var,
+                 font=FONT_LABEL, fg=FG_WARN, bg=BG).pack(side=tk.RIGHT, padx=10)
 
-        # ── Main content: X-ray panels + right sidebar ───────────────────────
-        content = tk.Frame(self, bg=BG)
-        content.pack(fill=tk.BOTH, expand=True, padx=12, pady=8)
+        # ── X-ray display panels ──────────────────────────────────────────────
+        display = tk.Frame(self, bg=BG)
+        display.pack(fill=tk.BOTH, expand=True, padx=12, pady=6)
 
-        # AP panel
-        ap_col = tk.Frame(content, bg=BG2, padx=6, pady=6)
-        ap_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
+        ap_col = tk.Frame(display, bg=BG2, padx=6, pady=6)
+        ap_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8)
+        tk.Label(ap_col, text="AP  (anteroposterior)",
+                 font=FONT_BODY, fg=FG_MUTED, bg=BG2).pack()
+        self._ap_lbl = tk.Label(ap_col, bg="#000")
+        self._ap_lbl.pack(pady=4, fill=tk.BOTH, expand=True)
 
-        tk.Label(
-            ap_col, text="AP (Craniocaudal) View",
-            font=FONT_BODY, fg=FG_MUTED, bg=BG2,
-        ).pack()
-        self._ap_lbl = tk.Label(ap_col, bg="#000",
-                                 width=XRAY_DISPLAY_W, height=XRAY_DISPLAY_H)
-        self._ap_lbl.pack(pady=4)
+        lat_col = tk.Frame(display, bg=BG2, padx=6, pady=6)
+        lat_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8)
+        tk.Label(lat_col, text="Lateral",
+                 font=FONT_BODY, fg=FG_MUTED, bg=BG2).pack()
+        self._lat_lbl = tk.Label(lat_col, bg="#000")
+        self._lat_lbl.pack(pady=4, fill=tk.BOTH, expand=True)
 
-        # LAT panel
-        lat_col = tk.Frame(content, bg=BG2, padx=6, pady=6)
-        lat_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
+        # Model name strip
+        self._model_var = tk.StringVar(value="")
+        tk.Label(self, textvariable=self._model_var,
+                 font=FONT_LABEL, fg=FG_MUTED, bg=BG2, pady=3
+                 ).pack(fill=tk.X, side=tk.BOTTOM)
 
-        tk.Label(
-            lat_col, text="Lateral View",
-            font=FONT_BODY, fg=FG_MUTED, bg=BG2,
-        ).pack()
-        self._lat_lbl = tk.Label(lat_col, bg="#000",
-                                  width=XRAY_DISPLAY_W, height=XRAY_DISPLAY_H)
-        self._lat_lbl.pack(pady=4)
-
-        # ── Right sidebar ────────────────────────────────────────────────────
-        sidebar = tk.Frame(content, bg=BG2, width=220)
-        sidebar.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 0))
-        sidebar.pack_propagate(False)   # keep fixed width
-
-        # Tool panel
-        self._tool_panel = ToolPanel(
-            sidebar,
-            on_change=self._on_tool_changed,
-        )
-        self._tool_panel.pack(fill=tk.X, padx=4, pady=(8, 4))
-
-        # Separator
-        tk.Frame(sidebar, bg=BG3, height=1).pack(fill=tk.X, padx=8, pady=6)
-
-        # Depth readout
-        tk.Label(
-            sidebar, text="INSERTION DEPTH",
-            font=("Segoe UI", 8, "bold"), fg=FG_MUTED, bg=BG2,
-        ).pack(anchor=tk.W, padx=8, pady=(4, 0))
-
-        self._depth_var = tk.StringVar(value="— mm")
-        tk.Label(
-            sidebar, textvariable=self._depth_var,
-            font=("Segoe UI", 20, "bold"), fg=FG_SUCCESS, bg=BG2,
-        ).pack(anchor=tk.W, padx=8, pady=(2, 8))
-
-        # Separator
-        tk.Frame(sidebar, bg=BG3, height=1).pack(fill=tk.X, padx=8, pady=6)
-
-        # Calibration reminder note
-        tk.Label(
-            sidebar,
-            text="ℹ  Calibrate with either\ntool. If using a custom\ntool, set tip distance\nbefore navigating.",
-            font=("Segoe UI", 8), fg=FG_MUTED, bg=BG2,
-            justify=tk.LEFT,
-        ).pack(anchor=tk.W, padx=8, pady=4)
-
-        # ── Bottom strip ─────────────────────────────────────────────────────
-        bottom = tk.Frame(self, bg=BG2, pady=4)
-        bottom.pack(fill=tk.X, side=tk.BOTTOM)
-
-        self._bottom_info_var = tk.StringVar(value="")
-        tk.Label(
-            bottom, textvariable=self._bottom_info_var,
-            font=FONT_LABEL, fg=FG_MUTED, bg=BG2,
-        ).pack()
-
-    # ── Lifecycle ───────────────────────────────────────────────────────────
+    # ── Lifecycle ────────────────────────────────────────────────────────────
 
     def on_show(self, **kwargs):
         model = self._state.model
-
-        if not model.has_xrays:
-            messagebox.showwarning(
-                "No X-rays",
-                "This model has no X-ray images. Run OR Setup first.",
-            )
+        if model is None:
+            messagebox.showwarning("No Model", "No model selected.")
             return
 
-        if not model.has_projection:
-            messagebox.showwarning(
-                "No Projection Data",
-                "Projection matrices are missing. Run OR Setup to compute them.\n"
-                "X-rays will be displayed without tracking.",
-            )
+        self._model_var.set(f"Model: {model.name}")
 
-        # Ensure navigation starts with standard probe active —
-        # the custom tool is only valid after the user deliberately selects it.
-        self._tool_panel.set_tool("standard_probe")
-        self._status_var.set("Ready — Standard Probe active.")
+        if not model.has_xrays:
+            messagebox.showwarning("No X-rays",
+                                   "This model has no X-ray images.  Run OR Setup first.")
+        if not model.has_projection:
+            messagebox.showwarning("No Projection",
+                                   "Projection matrices missing.  Run OR Setup first.")
+
         self._show_blank_xrays()
 
         if self._realtime:
             self._start_realtime()
-        else:
-            self._update_capture_btn_visibility()
+        self._update_capture_btn()
 
     def on_hide(self):
         self._stop_realtime()
 
-    # ── Tool change callback ─────────────────────────────────────────────────
-
-    def _on_tool_changed(self, tool_key: str):
-        """
-        Called by ToolPanel whenever the active tool or tip distance changes.
-        Updates the status bar and bottom info strip.
-        """
-        tool = config.get_active_tool()
-        self._status_var.set(
-            f"Active tool: {tool.name}  |  tip {tool.tip_distance_mm:.0f} mm from cube face"
-        )
-        self._bottom_info_var.set(
-            f"{tool.name}  —  tip offset {tool.tip_distance_mm:.0f} mm"
-        )
-
-    # ── Mode management ─────────────────────────────────────────────────────
+    # ── Mode ─────────────────────────────────────────────────────────────────
 
     def _toggle_mode(self):
         self._realtime = self._mode_var.get()
         if self._realtime:
-            self._stop_realtime()
             self._start_realtime()
         else:
             self._stop_realtime()
-        self._update_capture_btn_visibility()
+        self._update_capture_btn()
 
-    def _update_capture_btn_visibility(self):
-        state = tk.DISABLED if self._realtime else tk.NORMAL
-        self._capture_btn.configure(state=state)
+    def _update_capture_btn(self):
+        self._capture_btn.configure(
+            state=tk.DISABLED if self._realtime else tk.NORMAL
+        )
 
-    # ── Real-time loop ───────────────────────────────────────────────────────
+    # ── Real-time loop ────────────────────────────────────────────────────────
 
     def _start_realtime(self):
-        self._status_var.set("Real-time mode active.")
+        self._status_var.set("Live")
         self._tick()
 
     def _stop_realtime(self):
@@ -260,79 +177,77 @@ class NavigationView(DarkFrame):
             except Exception:
                 pass
             self._after_id = None
+        self._status_var.set("")
 
     def _tick(self):
         self._render_overlay()
         self._after_id = self.after(NAV_UPDATE_MS, self._tick)
 
-    # ── Snapshot ─────────────────────────────────────────────────────────────
-
     def _capture(self):
-        self._status_var.set("Capturing…")
-        self._render_overlay()
         self._status_var.set("Captured.")
+        self._render_overlay()
 
-    # ── Core render ──────────────────────────────────────────────────────────
+    # ── Core render ───────────────────────────────────────────────────────────
 
     def _render_overlay(self):
         if self._state.overlay_ap is None or self._state.overlay_lat is None:
             return
 
-        frame_ap  = self._state.cap_ap.get_frame()  if self._state.cap_ap  else None
-        frame_lat = self._state.cap_lat.get_frame() if self._state.cap_lat else None
+        # ── Grab frames ──────────────────────────────────────────────────────
+        frame1 = self._state.cap1.get_frame() if self._state.cap1 else None
+        frame2 = self._state.cap2.get_frame() if self._state.cap2 else None
 
-        det_ap  = None
-        det_lat = None
+        # ── Board tracking → camera-to-model transforms ───────────────────────
+        xfm1 = (self._state.board_tracker.estimate_pose(
+                    frame1, self._state.mtx1, self._state.dist1)
+                if frame1 is not None and self._state.mtx1 is not None else None)
 
-        if frame_ap is not None and self._state.mtx_ap is not None:
-            det_ap = self._state.tracker.detect(
-                frame_ap, self._state.mtx_ap, self._state.dist_ap,
-            )
-        if frame_lat is not None and self._state.mtx_lat is not None:
-            det_lat = self._state.tracker.detect(
-                frame_lat, self._state.mtx_lat, self._state.dist_lat,
-            )
+        xfm2 = (self._state.board_tracker.estimate_pose(
+                    frame2, self._state.mtx2, self._state.dist2)
+                if frame2 is not None and self._state.mtx2 is not None else None)
 
-        # Detection status label
-        if det_ap is not None or det_lat is not None:
-            self._detect_var.set(
-                f"Probe detected  (AP: {'✔' if det_ap else '✘'}  "
-                f"LAT: {'✔' if det_lat else '✘'})"
-            )
-            self._detect_lbl.configure(fg=FG_SUCCESS)
-        else:
-            self._detect_var.set("Probe: not detected")
-            self._detect_lbl.configure(fg=FG_ERR)
-
-        # Depth readout from whichever camera detected the probe
-        det_for_depth = det_ap or det_lat
-        if det_for_depth is not None and self._state.xfm_ap is not None:
-            tip   = self._state.xfm_ap.point_cam_to_model(det_for_depth.rod_tip_cam)
-            base  = self._state.xfm_ap.point_cam_to_model(det_for_depth.rod_base_cam)
-            depth = float(np.linalg.norm(tip - base))
-            self._depth_var.set(f"{depth:.1f} mm")
-        else:
-            self._depth_var.set("— mm")
-
-        # Render overlays
-        img_ap  = self._state.overlay_ap.render(det_ap,  self._state.xfm_ap)
-        img_lat = self._state.overlay_lat.render(
-            det_lat if det_lat is not None else det_ap,
-            self._state.xfm_lat,
+        board_seen = sum(x is not None for x in (xfm1, xfm2))
+        self._board_var.set(
+            f"Board: {board_seen}/2 cameras" if board_seen
+            else "Board: not visible"
         )
+
+        # ── Probe detection ───────────────────────────────────────────────────
+        det1 = (self._state.probe_tracker.detect(
+                    frame1, self._state.mtx1, self._state.dist1)
+                if frame1 is not None and self._state.mtx1 is not None else None)
+
+        det2 = (self._state.probe_tracker.detect(
+                    frame2, self._state.mtx2, self._state.dist2)
+                if frame2 is not None and self._state.mtx2 is not None else None)
+
+        # ── Pose fusion ───────────────────────────────────────────────────────
+        fused = fuse_poses(det1, xfm1, det2, xfm2)
+
+        if fused is not None:
+            self._probe_var.set(
+                f"Probe: {fused.confidence_label}  "
+                f"| depth {fused.insertion_depth_mm:.0f} mm"
+            )
+        else:
+            self._probe_var.set("Probe: not detected")
+
+        # ── Render onto X-rays ────────────────────────────────────────────────
+        img_ap  = self._state.overlay_ap.render(fused)
+        img_lat = self._state.overlay_lat.render(fused)
 
         self._last_ap  = img_ap
         self._last_lat = img_lat
-        self._display_xray(img_ap,  self._ap_lbl,  "ap")
-        self._display_xray(img_lat, self._lat_lbl, "lat")
+        self._display(img_ap,  self._ap_lbl,  "ap")
+        self._display(img_lat, self._lat_lbl, "lat")
 
-    def _display_xray(self, img: np.ndarray, label: tk.Label, tag: str):
+    def _display(self, img: np.ndarray, label: tk.Label, tag: str):
         try:
             tk_img = frame_to_tk(img, XRAY_DISPLAY_W, XRAY_DISPLAY_H)
             label.configure(image=tk_img)
             label.image = tk_img
             if tag == "ap":
-                self._tk_img_ap = tk_img
+                self._tk_img_ap  = tk_img
             else:
                 self._tk_img_lat = tk_img
         except Exception:
@@ -340,24 +255,20 @@ class NavigationView(DarkFrame):
 
     def _show_blank_xrays(self):
         model = self._state.model
-        if model.xray_ap is not None:
-            self._display_xray(model.xray_ap, self._ap_lbl, "ap")
-        if model.xray_lat is not None:
-            self._display_xray(model.xray_lat, self._lat_lbl, "lat")
+        if model and model.xray_ap is not None:
+            self._display(model.xray_ap,  self._ap_lbl,  "ap")
+        if model and model.xray_lat is not None:
+            self._display(model.xray_lat, self._lat_lbl, "lat")
 
-    # ── Utilities ────────────────────────────────────────────────────────────
+    # ── Save ──────────────────────────────────────────────────────────────────
 
     def _save(self):
         if self._last_ap is None:
-            messagebox.showinfo("Save", "No image to save yet — capture first.")
+            messagebox.showinfo("Save", "Nothing to save yet — capture first.")
             return
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        cv2.imwrite(f"fluorosim_AP_{ts}.png",  self._last_ap)
-        cv2.imwrite(f"fluorosim_LAT_{ts}.png", self._last_lat)
-        self._status_var.set(
-            f"Saved:  fluorosim_AP_{ts}.png  and  fluorosim_LAT_{ts}.png"
-        )
-
-    def _recalibrate(self):
-        self._stop_realtime()
-        self._app.show_view("model_calib")
+        ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ap  = f"fluorosim_ap_{ts}.png"
+        lat = f"fluorosim_lat_{ts}.png"
+        cv2.imwrite(ap,  self._last_ap)
+        cv2.imwrite(lat, self._last_lat)
+        messagebox.showinfo("Saved", f"Images saved:\n  {ap}\n  {lat}")

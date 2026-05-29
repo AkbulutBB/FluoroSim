@@ -1,22 +1,30 @@
 """
-ui/intrinsic_calib.py — Step 2: Per-camera intrinsic calibration.
+ui/intrinsic_calib.py — Step 2: Lens intrinsic calibration.
 
-Shows live checkerboard detection for both cameras simultaneously.
-Collects INTRINSIC_CALIB_FRAMES diverse views then solves for
-the lens intrinsics and saves them to disk.
+Guides the user through checkerboard calibration for Camera 1 (cranial)
+and then Camera 2 (oblique).  Saved intrinsics are loaded automatically
+on subsequent sessions — this step is skipped if both are already saved.
 """
 
 import tkinter as tk
 from tkinter import messagebox
+import cv2
 import numpy as np
 
 from ui.widgets import (
     DarkFrame, CameraPreview, primary_btn, success_btn,
-    section_label, info_label, StatusLight,
-    BG, BG2, FG, FG_MUTED, FG_SUCCESS, FG_WARN, FONT_LABEL, FONT_BODY,
+    info_label, section_label,
+    BG, BG2, FG, FG_MUTED, FG_SUCCESS, FG_ERR, FG_WARN,
+    FONT_BODY, FONT_LABEL, FONT_TITLE,
 )
 from core.camera import IntrinsicCalibrator, save_intrinsics
-from config import PREVIEW_W, PREVIEW_H, INTRINSIC_CALIB_FRAMES, CAMERAS_DIR
+from config import INTRINSIC_CALIB_FRAMES, PREVIEW_W, PREVIEW_H
+
+
+_CAMERA_LABELS = {
+    1: "Camera 1 — Cranial (straight down)",
+    2: "Camera 2 — Oblique (45°)",
+}
 
 
 class IntrinsicCalibView(DarkFrame):
@@ -26,172 +34,144 @@ class IntrinsicCalibView(DarkFrame):
         self._app   = app
         self._state = state
 
-        self._cal_ap  = IntrinsicCalibrator()
-        self._cal_lat = IntrinsicCalibrator()
+        self._current_cam = 1   # 1 or 2
+        self._calibrator: IntrinsicCalibrator = IntrinsicCalibrator()
+        self._after_id = None
 
         self._build()
 
-    # ── Build ───────────────────────────────────────────────────────────────
+    # ── Build ────────────────────────────────────────────────────────────────
 
     def _build(self):
-        hdr = tk.Frame(self, bg=BG2)
-        hdr.pack(fill=tk.X, pady=(0, 8))
-        section_label(hdr, "Step 2 — Intrinsic Calibration").pack(pady=10)
+        hdr = tk.Frame(self, bg=BG2, pady=10)
+        hdr.pack(fill=tk.X)
+        section_label(hdr, "Step 2 — Camera Calibration").pack(pady=6)
         info_label(
             hdr,
-            f"This step measures lens distortion for each camera. "
-            f"Print or display a 9×6 checkerboard pattern, hold it in front of each camera, "
-            f"and tilt/rotate it slowly in different orientations. "
-            f"The system auto-collects {INTRINSIC_CALIB_FRAMES} frames, then click Compute. "
-            f"Calibration is saved and never needs repeating for these cameras.",
+            "Hold a printed checkerboard in front of each camera and move it "
+            "slowly to different positions and angles.  The system collects "
+            f"{INTRINSIC_CALIB_FRAMES} frames automatically.  "
+            "Calibration is saved and this step is skipped in future sessions.",
             color=FG_MUTED,
-        ).pack(pady=(0, 4))
+        ).pack(padx=20, pady=(0, 6))
 
-        # Checkerboard link
-        link_row = tk.Frame(hdr, bg=BG2)
-        link_row.pack(pady=(0, 6))
-        tk.Label(link_row, text="Print checkerboard from:  ", font=FONT_LABEL, fg=FG_MUTED, bg=BG2).pack(side=tk.LEFT)
-        link = tk.Label(link_row, text="https://docs.opencv.org/4.x/pattern.png",
-                        font=FONT_LABEL, fg="#4fc3f7", bg=BG2, cursor="hand2")
-        link.pack(side=tk.LEFT)
+        self._cam_title = tk.StringVar(value="")
+        tk.Label(self, textvariable=self._cam_title,
+                 font=FONT_TITLE, fg=FG, bg=BG).pack(pady=4)
 
-        # Skip option
-        skip_row = tk.Frame(hdr, bg=BG2)
-        skip_row.pack(pady=(0, 8))
-        tk.Label(skip_row, text="Testing only — no checkerboard? ",
-                 font=FONT_LABEL, fg=FG_WARN, bg=BG2).pack(side=tk.LEFT)
-        primary_btn(skip_row, "Skip (use estimated intrinsics)",
-                    command=self._skip, width=28).pack(side=tk.LEFT, padx=6)
+        self._progress_var = tk.StringVar(value="")
+        tk.Label(self, textvariable=self._progress_var,
+                 font=FONT_BODY, fg=FG_WARN, bg=BG).pack()
 
-        # Progress indicators
-        prog_row = tk.Frame(self, bg=BG)
-        prog_row.pack(pady=4)
-        self._status_ap  = StatusLight(prog_row, f"AP:  0/{INTRINSIC_CALIB_FRAMES} frames")
-        self._status_ap.pack(side=tk.LEFT, padx=20)
-        self._status_lat = StatusLight(prog_row, f"LAT: 0/{INTRINSIC_CALIB_FRAMES} frames")
-        self._status_lat.pack(side=tk.LEFT, padx=20)
+        self._preview = CameraPreview(self, width=PREVIEW_W, height=PREVIEW_H)
+        self._preview.pack(pady=8)
 
-        # RMS error display
-        self._rms_var = tk.StringVar(value="")
-        tk.Label(self, textvariable=self._rms_var,
-                 font=FONT_LABEL, fg=FG_MUTED, bg=BG).pack()
-
-        # Previews
-        prev_row = tk.Frame(self, bg=BG)
-        prev_row.pack(fill=tk.BOTH, expand=True, pady=8)
-
-        self._prev_ap  = CameraPreview(prev_row, "AP Camera",  width=560, height=380)
-        self._prev_ap.pack(side=tk.LEFT, padx=8, fill=tk.BOTH, expand=True)
-
-        self._prev_lat = CameraPreview(prev_row, "LAT Camera", width=560, height=380)
-        self._prev_lat.pack(side=tk.LEFT, padx=8, fill=tk.BOTH, expand=True)
-
-        # Buttons
-        btn_row = tk.Frame(self, bg=BG)
-        btn_row.pack(pady=10)
-        self._compute_btn = success_btn(btn_row, "Compute intrinsics →",
-                                         command=self._compute, width=22)
+        btns = tk.Frame(self, bg=BG)
+        btns.pack(pady=10)
+        primary_btn(btns, "↩ Back", command=self._app.go_home, width=12).pack(side=tk.LEFT, padx=8)
+        self._compute_btn = success_btn(btns, "Compute & Save →",
+                                        command=self._compute, width=18)
         self._compute_btn.configure(state=tk.DISABLED)
         self._compute_btn.pack(side=tk.LEFT, padx=8)
 
-    # ── Lifecycle ───────────────────────────────────────────────────────────
+    # ── Lifecycle ────────────────────────────────────────────────────────────
 
     def on_show(self, **kwargs):
-        # Reset calibrators in case we return to this view
-        self._cal_ap  = IntrinsicCalibrator()
-        self._cal_lat = IntrinsicCalibrator()
-
-        self._prev_ap.start(
-            source_fn  = self._state.cap_ap.get_frame,
-            process_fn = self._process_ap,
-        )
-        self._prev_lat.start(
-            source_fn  = self._state.cap_lat.get_frame,
-            process_fn = self._process_lat,
-        )
+        # Determine which camera still needs calibration
+        if self._state.mtx1 is None:
+            self._start_camera(1)
+        elif self._state.mtx2 is None:
+            self._start_camera(2)
+        else:
+            self._app.proceed_after_intrinsic_calib()
 
     def on_hide(self):
-        self._prev_ap.stop()
-        self._prev_lat.stop()
+        self._stop()
 
-    # ── Processing ──────────────────────────────────────────────────────────
+    # ── Camera loop ──────────────────────────────────────────────────────────
 
-    def _process_ap(self, frame):
-        annotated, accepted = self._cal_ap.process_frame(frame)
-        n = self._cal_ap.n_frames
-        state = "ok" if self._cal_ap.is_done else ("warn" if n > 0 else "pending")
-        self._status_ap.set(state, f"AP:  {n}/{INTRINSIC_CALIB_FRAMES} frames")
-        self._maybe_enable_compute()
-        return annotated
+    def _start_camera(self, cam_num: int):
+        self._current_cam = cam_num
+        self._calibrator  = IntrinsicCalibrator()
+        self._cam_title.set(_CAMERA_LABELS[cam_num])
+        self._progress_var.set(f"0 / {INTRINSIC_CALIB_FRAMES} frames collected")
+        self._compute_btn.configure(state=tk.DISABLED)
+        self._preview.start(source_fn=self._get_annotated_frame)
+        self._tick()
 
-    def _process_lat(self, frame):
-        annotated, accepted = self._cal_lat.process_frame(frame)
-        n = self._cal_lat.n_frames
-        state = "ok" if self._cal_lat.is_done else ("warn" if n > 0 else "pending")
-        self._status_lat.set(state, f"LAT: {n}/{INTRINSIC_CALIB_FRAMES} frames")
-        self._maybe_enable_compute()
-        return annotated
+    def _get_cap(self):
+        return self._state.cap1 if self._current_cam == 1 else self._state.cap2
 
-    def _maybe_enable_compute(self):
-        if self._cal_ap.is_done and self._cal_lat.is_done:
-            self._compute_btn.configure(state=tk.NORMAL)
+    def _get_mtx(self):
+        return (self._state.mtx1 if self._current_cam == 1 else self._state.mtx2,
+                self._state.dist1 if self._current_cam == 1 else self._state.dist2)
 
-    def _skip(self):
-        """Use estimated intrinsics based on typical webcam parameters.
-        Accuracy will be lower but sufficient for testing the full flow."""
-        import numpy as np
+    def _get_annotated_frame(self):
+        """Return the most recently annotated frame for the preview widget."""
+        return getattr(self, "_last_annotated", None)
 
-        def _estimate(cap):
-            """Build a reasonable pinhole matrix from the actual frame size."""
-            frame = cap.get_frame() if cap else None
-            if frame is not None:
-                h, w = frame.shape[:2]
-            else:
-                w, h = 1280, 720
-            f  = 0.85 * max(w, h)   # typical focal length estimate
-            cx, cy = w / 2.0, h / 2.0
-            mtx  = np.array([[f, 0, cx], [0, f, cy], [0, 0, 1]], dtype=np.float64)
-            dist = np.zeros(5, dtype=np.float64)
-            return mtx, dist
+    def _tick(self):
+        cap = self._get_cap()
+        if cap is None:
+            self._after_id = self.after(50, self._tick)
+            return
 
-        mtx_ap,  dist_ap  = _estimate(self._state.cap_ap)
-        mtx_lat, dist_lat = _estimate(self._state.cap_lat)
+        frame = cap.get_frame()
+        if frame is not None:
+            annotated, accepted = self._calibrator.process_frame(frame)
+            self._last_annotated = annotated
 
-        self._state.mtx_ap   = mtx_ap
-        self._state.dist_ap  = dist_ap
-        self._state.mtx_lat  = mtx_lat
-        self._state.dist_lat = dist_lat
+            n = self._calibrator.n_frames
+            self._progress_var.set(f"{n} / {INTRINSIC_CALIB_FRAMES} frames collected")
 
-        # Save so subsequent sessions also skip
-        save_intrinsics(str(self._state.cam_ap_idx),  mtx_ap,  dist_ap)
-        save_intrinsics(str(self._state.cam_lat_idx), mtx_lat, dist_lat)
+            if self._calibrator.is_done:
+                self._compute_btn.configure(state=tk.NORMAL)
+                self._progress_var.set(
+                    f"{INTRINSIC_CALIB_FRAMES} frames collected — click Compute & Save"
+                )
+                self._stop()
+                return
 
-        print("[DEBUG] Skipped intrinsic calibration — using estimated values")
-        messagebox.showinfo(
-            "Estimated intrinsics",
-            "Using estimated camera parameters. Suitable for testing.\n"
-            "For real training sessions, return here and calibrate with a checkerboard.",
-        )
-        self._app.proceed_after_intrinsic_calib()
+        self._after_id = self.after(50, self._tick)
+
+    def _stop(self):
+        if self._after_id:
+            try:
+                self.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+        self._preview.stop()
+
+    # ── Compute ──────────────────────────────────────────────────────────────
 
     def _compute(self):
         try:
-            mtx_ap,  dist_ap,  rms_ap  = self._cal_ap.compute()
-            mtx_lat, dist_lat, rms_lat = self._cal_lat.compute()
-        except Exception as exc:
-            messagebox.showerror("Calibration Error", str(exc))
+            mtx, dist, rms = self._calibrator.compute()
+        except RuntimeError as e:
+            messagebox.showerror("Calibration Error", str(e))
             return
 
-        self._state.mtx_ap   = mtx_ap
-        self._state.dist_ap  = dist_ap
-        self._state.mtx_lat  = mtx_lat
-        self._state.dist_lat = dist_lat
+        cam_id = str(self._state.cam1_idx if self._current_cam == 1
+                     else self._state.cam2_idx)
+        save_intrinsics(cam_id, mtx, dist)
 
-        save_intrinsics(str(self._state.cam_ap_idx),  mtx_ap,  dist_ap)
-        save_intrinsics(str(self._state.cam_lat_idx), mtx_lat, dist_lat)
+        if self._current_cam == 1:
+            self._state.mtx1  = mtx
+            self._state.dist1 = dist
+        else:
+            self._state.mtx2  = mtx
+            self._state.dist2 = dist
 
-        self._rms_var.set(
-            f"Calibration complete. RMS reprojection error — AP: {rms_ap:.3f} px, "
-            f"LAT: {rms_lat:.3f} px. (< 1.0 px is excellent)"
+        messagebox.showinfo(
+            "Calibration Saved",
+            f"Camera {self._current_cam} calibrated.\n"
+            f"Reprojection RMS: {rms:.3f} px\n\n"
+            f"{'Good — proceeding to Camera 2.' if self._current_cam == 1 else 'Both cameras calibrated.'}"
         )
-        self.after(1200, self._app.proceed_after_intrinsic_calib)
+
+        # Advance to next camera or next step
+        if self._current_cam == 1 and self._state.mtx2 is None:
+            self._start_camera(2)
+        else:
+            self._app.proceed_after_intrinsic_calib()

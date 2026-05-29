@@ -1,86 +1,84 @@
 """
-core/projection.py — Projects probe pose from model space into X-ray pixel space.
+core/projection.py — X-ray projection matrix and overlay rendering.
 
-The X-ray is modelled as a pinhole camera (the C-arm IS a camera).
-The 3×4 projection matrix P is computed once during the OR visit from
-N ≥ 6 radiopaque fiducial correspondences:
-    3-D model coordinate ↔ 2-D pixel in the stored X-ray image.
+The C-arm fluoroscope is modelled as a pinhole camera.  During the one-time
+OR visit, N ≥ 6 radiopaque fiducials with known 3-D model-space coordinates
+are clicked in the stored X-ray images.  The Direct Linear Transform (DLT)
+computes a 3×4 projection matrix P from these correspondences.
 
-At runtime, any 3-D point in model space is projected via:
-    [u·w, v·w, w]ᵀ  =  P  ×  [X, Y, Z, 1]ᵀ
-    (u, v) = pixel in X-ray image
+At runtime, the fused probe pose (model space) is projected through P to
+obtain pixel positions on the stored X-ray, and the trajectory is drawn.
+
+No camera hardware is involved at runtime — only the pre-acquired X-ray
+images and the pre-computed projection matrices are used.
 """
 
 import cv2
 import numpy as np
-from typing import Optional, Tuple
 from pathlib import Path
+from typing import Optional
 
-from core.calibration import CameraModelTransform
-from core.tracker import ProbeDetection
+from core.pose_fusion import FusedPose
 from config import (
-    ROD_TIP_IN_CUBE, ROD_BASE_IN_CUBE,
     OVERLAY_COLOR_TIP, OVERLAY_COLOR_SHAFT,
     OVERLAY_THICKNESS, OVERLAY_TIP_RADIUS, OVERLAY_SHAFT_EXTEND,
+    MODELS_DIR,
 )
 
 
-# ─── DLT — Direct Linear Transform ────────────────────────────────────────────
+# ── Direct Linear Transform ────────────────────────────────────────────────────
 
 def compute_projection_matrix(
-    obj_pts: np.ndarray,   # (N, 3) 3-D model coordinates
-    img_pts: np.ndarray,   # (N, 2) pixel positions in X-ray image
-) -> np.ndarray:           # (3, 4) projection matrix P
+    obj_pts: np.ndarray,   # (N, 3)  3-D model coordinates
+    img_pts: np.ndarray,   # (N, 2)  pixel positions in X-ray image
+) -> np.ndarray:           # (3, 4)  projection matrix P
     """
-    Compute the 3×4 projective matrix via the DLT algorithm.
-    Requires N ≥ 6 non-degenerate correspondences.
+    Compute a 3×4 projective matrix P via the DLT algorithm.
+    Requires N ≥ 6 non-degenerate, non-coplanar correspondences.
     """
     N = len(obj_pts)
     if N < 6:
-        raise ValueError(f"Need at least 6 correspondences, got {N}.")
+        raise ValueError(f"DLT requires at least 6 correspondences (got {N}).")
 
     A = []
     for (X, Y, Z), (u, v) in zip(obj_pts, img_pts):
-        A.append([-X, -Y, -Z, -1,  0,  0,  0,  0, u*X, u*Y, u*Z, u])
-        A.append([ 0,  0,  0,  0, -X, -Y, -Z, -1, v*X, v*Y, v*Z, v])
+        A.append([-X, -Y, -Z, -1,  0,  0,  0,  0, u*X, u*Y, u*Z,  u])
+        A.append([ 0,  0,  0,  0, -X, -Y, -Z, -1, v*X, v*Y, v*Z,  v])
 
-    A = np.array(A, dtype=np.float64)
+    A  = np.array(A, dtype=np.float64)
     _, _, Vt = np.linalg.svd(A)
-    P = Vt[-1].reshape(3, 4)
-
-    # Normalise so that the last row has unit norm
-    P /= np.linalg.norm(P[2, :3])
+    P  = Vt[-1].reshape(3, 4)
+    P /= np.linalg.norm(P[2, :3])   # normalise so homogeneous scale is consistent
     return P
 
 
 def project_point(P: np.ndarray, pt_model: np.ndarray) -> np.ndarray:
-    """Project a single 3-D model point to 2-D pixel via matrix P."""
+    """Project a single 3-D model-space point to a 2-D pixel via P."""
     ph  = np.append(pt_model.flatten(), 1.0)
     uvw = P @ ph
     return uvw[:2] / uvw[2]
 
 
 def reprojection_error(
-    P: np.ndarray,
+    P:       np.ndarray,
     obj_pts: np.ndarray,
     img_pts: np.ndarray,
 ) -> float:
-    """Mean reprojection error in pixels for validation."""
-    errors = []
-    for pt3d, pt2d in zip(obj_pts, img_pts):
-        proj = project_point(P, pt3d)
-        errors.append(np.linalg.norm(proj - pt2d))
+    """Mean reprojection error in pixels — used to validate OR setup quality."""
+    errors = [np.linalg.norm(project_point(P, p3) - p2)
+              for p3, p2 in zip(obj_pts, img_pts)]
     return float(np.mean(errors))
 
 
-# ─── Overlay renderer ─────────────────────────────────────────────────────────
+# ── X-ray overlay renderer ─────────────────────────────────────────────────────
 
 class XRayOverlay:
     """
-    Renders the probe trajectory onto a stored X-ray image.
+    Renders the fused probe trajectory onto a stored X-ray image.
 
-    Accepts a probe detection in camera space, the camera-to-model transform,
-    and the X-ray projection matrix.  Returns an annotated copy of the X-ray.
+    Accepts a FusedPose (model space) and the pre-computed projection matrix
+    for this X-ray view.  Returns an annotated copy of the stored X-ray.
+    The live camera feed is never shown — only the X-ray with overlay.
     """
 
     def __init__(self, xray_image: np.ndarray, P: np.ndarray):
@@ -89,70 +87,62 @@ class XRayOverlay:
 
     @property
     def blank(self) -> np.ndarray:
-        """Return the unmodified X-ray."""
+        """Return the unmodified X-ray (no overlay)."""
         return self._xray.copy()
 
-    def render(
-        self,
-        detection: Optional[ProbeDetection],
-        cam_model_xfm: CameraModelTransform,
-        extend_mm: float = OVERLAY_SHAFT_EXTEND,
-    ) -> np.ndarray:
+    def render(self, fused: Optional[FusedPose]) -> np.ndarray:
         """
-        Return the X-ray image with probe overlay, or the plain X-ray if
-        no detection is provided.
+        Return the X-ray with the probe trajectory overlay drawn on it.
+
+        If fused is None, returns the plain X-ray with a 'not detected' notice.
         """
         out = self._xray.copy()
 
-        if detection is None:
+        if fused is None:
             cv2.putText(
                 out, "Probe not detected", (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 80, 255), 2,
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 80, 255), 2,
             )
             return out
 
-        # 1. Transform rod geometry from camera space to model space
-        tip_model  = cam_model_xfm.point_cam_to_model(detection.rod_tip_cam)
-        base_model = cam_model_xfm.point_cam_to_model(detection.rod_base_cam)
+        # Extend the shaft line past the tip for visual clarity
+        shaft_end = fused.tip_model + fused.dir_model * OVERLAY_SHAFT_EXTEND
 
-        # 2. Extend shaft line in model space for visual clarity
-        direction  = tip_model - base_model
-        norm       = np.linalg.norm(direction)
-        if norm < 1e-6:
-            return out
-        unit = direction / norm
-        shaft_end = tip_model + unit * extend_mm
+        # Project model-space points to X-ray pixel positions
+        px_base = project_point(self._P, fused.base_model).astype(int)
+        px_tip  = project_point(self._P, fused.tip_model ).astype(int)
+        px_end  = project_point(self._P, shaft_end       ).astype(int)
 
-        # 3. Project all points to X-ray pixel space
-        px_tip  = project_point(self._P, tip_model).astype(int)
-        px_base = project_point(self._P, base_model).astype(int)
-        px_end  = project_point(self._P, shaft_end).astype(int)
-
-        # 4. Draw: shaft from base through tip and onward, dot at tip
+        # Shaft line: from rod base, through tip, and slightly beyond
         cv2.line(out, tuple(px_base), tuple(px_end), OVERLAY_COLOR_SHAFT, OVERLAY_THICKNESS)
-        cv2.circle(out, tuple(px_tip), OVERLAY_TIP_RADIUS, OVERLAY_COLOR_TIP, -1)
-        cv2.circle(out, tuple(px_tip), OVERLAY_TIP_RADIUS + 3, OVERLAY_COLOR_TIP, 2)
 
-        # Depth annotation (distance from base to tip in mm)
-        depth = float(np.linalg.norm(tip_model - base_model))
+        # Tip marker: filled circle with ring
+        cv2.circle(out, tuple(px_tip), OVERLAY_TIP_RADIUS,     OVERLAY_COLOR_TIP, -1)
+        cv2.circle(out, tuple(px_tip), OVERLAY_TIP_RADIUS + 3, OVERLAY_COLOR_TIP,  2)
+
+        # Status annotation at bottom of image
+        depth_text = (
+            f"{fused.confidence_label}   "
+            f"depth: {fused.insertion_depth_mm:.0f} mm"
+        )
         cv2.putText(
-            out, f"Depth: {depth:.0f} mm",
+            out, depth_text,
             (20, out.shape[0] - 20),
             cv2.FONT_HERSHEY_SIMPLEX, 0.7, OVERLAY_COLOR_TIP, 2,
         )
         return out
 
 
-# ─── Persistence ──────────────────────────────────────────────────────────────
+# ── Persistence ────────────────────────────────────────────────────────────────
 
-def save_projection_matrix(model_id: str, view: str, P: np.ndarray, models_dir: str):
-    path = Path(models_dir) / model_id
+def save_projection_matrix(model_id: str, view: str, P: np.ndarray):
+    path = Path(MODELS_DIR) / model_id
     path.mkdir(parents=True, exist_ok=True)
     np.save(str(path / f"P_{view}.npy"), P)
 
 
-def load_projection_matrix(model_id: str, view: str, models_dir: str) -> Optional[np.ndarray]:
-    p = Path(models_dir) / model_id / f"P_{view}.npy"
+def load_projection_matrix(model_id: str, view: str) -> Optional[np.ndarray]:
+    p = Path(MODELS_DIR) / model_id / f"P_{view}.npy"
     if not p.exists():
         return None
     return np.load(str(p))
