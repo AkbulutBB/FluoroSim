@@ -50,13 +50,6 @@ class ModelSelectView(DarkFrame):
 
         self._listbox = tk.Listbox(
             list_frame,
-            bg=BG3, fg=FG, selectbackground=ACCENT2,
-            font=FONT_BODY, relief=tk.FLAT, height=12,
-            activestyle="none",
-        )
-        ACCENT2 = "#1f6feb"
-        self._listbox = tk.Listbox(
-            list_frame,
             bg=BG3, fg=FG, selectbackground="#1f6feb",
             font=FONT_BODY, relief=tk.FLAT, height=12,
             activestyle="none",

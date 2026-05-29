@@ -243,7 +243,8 @@ class NavigationView(DarkFrame):
 
     def _display(self, img: np.ndarray, label: tk.Label, tag: str):
         try:
-            tk_img = frame_to_tk(img, XRAY_DISPLAY_W, XRAY_DISPLAY_H)
+            tk_img = frame_to_tk(img, XRAY_DISPLAY_W, XRAY_DISPLAY_H,
+                                  master=label)
             label.configure(image=tk_img)
             label.image = tk_img
             if tag == "ap":

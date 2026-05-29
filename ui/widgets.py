@@ -92,8 +92,8 @@ class CameraPreview(tk.Frame):
         kw.setdefault("bg", BG2)
         super().__init__(parent, **kw)
 
-        self._w = width
-        self._h = height
+        self._width  = width
+        self._height = height
         self._after_id  = None
         self._source_fn: Optional[Callable] = None
         self._tk_img    = None
@@ -131,7 +131,11 @@ class CameraPreview(tk.Frame):
         if self._source_fn:
             frame = self._source_fn()
             if frame is not None:
-                tk_img = frame_to_tk(frame, self._w, self._h)
+                # Pass self._lbl as master so the PhotoImage is bound to the
+                # correct Tk interpreter — prevents "pyimage doesn't exist"
+                # errors when multiple Tk roots exist (e.g. Spyder/IPython).
+                tk_img = frame_to_tk(frame, self._width, self._height,
+                                     master=self._lbl)
                 self._lbl.configure(image=tk_img)
                 self._lbl.image = tk_img
                 self._tk_img    = tk_img
@@ -141,13 +145,17 @@ class CameraPreview(tk.Frame):
 # ── Image conversion utility ───────────────────────────────────────────────────
 
 def frame_to_tk(
-    frame: np.ndarray,
+    frame:    np.ndarray,
     target_w: int,
     target_h: int,
+    master:   object = None,
 ) -> ImageTk.PhotoImage:
     """
     Convert an OpenCV BGR frame to a Tkinter-compatible PhotoImage,
     scaling it to fit within target_w × target_h while preserving aspect ratio.
+
+    Pass master=<some_widget> to bind the PhotoImage to the correct Tk
+    interpreter.  Required when multiple Tk roots may exist (Spyder / IPython).
     """
     h, w = frame.shape[:2]
     scale = min(target_w / w, target_h / h)
@@ -155,4 +163,4 @@ def frame_to_tk(
 
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     pil = Image.fromarray(rgb).resize((nw, nh), Image.BILINEAR)
-    return ImageTk.PhotoImage(image=pil)
+    return ImageTk.PhotoImage(image=pil, master=master)
