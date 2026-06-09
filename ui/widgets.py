@@ -1,166 +1,170 @@
 """
-ui/widgets.py — Shared UI primitives and theme.
+ui/widgets.py  —  Reusable Tkinter widgets
+===========================================
 
-All views import colours, fonts, and widget factory functions from here
-to keep the visual language consistent across the application.
+  cv2_to_photo        : convert an OpenCV BGR frame to a Tk PhotoImage (fitted)
+  VideoPanel          : a label that shows live frames, updated from the main thread
+  ClickableImage      : show a static image and let the user drop numbered points,
+                        returning click coordinates in ORIGINAL image pixels
+  StatusChip          : a small coloured readiness indicator
 """
 
+from __future__ import annotations
+from typing import Callable, List, Optional, Tuple
 import tkinter as tk
-from typing import Optional, Callable
+from tkinter import ttk
+
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-# ── Colour palette ─────────────────────────────────────────────────────────────
-BG      = "#0d1117"   # page background
-BG2     = "#161b22"   # card / panel background
-BG3     = "#21262d"   # inset / input background
-ACCENT  = "#238636"   # primary action (green)
-ACCENT2 = "#1f6feb"   # secondary action (blue)
 
-FG         = "#e6edf3"   # primary text
-FG_MUTED   = "#8b949e"   # secondary text
-FG_SUCCESS = "#3fb950"   # success
-FG_ERR     = "#f85149"   # error
-FG_WARN    = "#d29922"   # warning
-
-# ── Typography ─────────────────────────────────────────────────────────────────
-FONT_TITLE = ("Segoe UI", 13, "bold")
-FONT_BODY  = ("Segoe UI", 10)
-FONT_LABEL = ("Segoe UI",  9)
-FONT_MONO  = ("Consolas",  9)
+# ── colour palette ───────────────────────────────────────────────────────────
+BG      = "#0f1419"
+PANEL   = "#1b232c"
+FG      = "#e6edf3"
+MUTED   = "#8b98a5"
+ACCENT  = "#4ea1ff"
+OK      = "#3fb950"
+WARN    = "#d29922"
+BAD     = "#f85149"
 
 
-# ── Base frame ─────────────────────────────────────────────────────────────────
-
-class DarkFrame(tk.Frame):
-    """Base class for all full-screen views."""
-    def __init__(self, parent, **kwargs):
-        kwargs.setdefault("bg", BG)
-        super().__init__(parent, **kwargs)
-
-    def on_show(self, **kwargs):
-        """Called when this view becomes active. Override as needed."""
-
-    def on_hide(self):
-        """Called when this view is hidden. Override to release resources."""
-
-
-# ── Button factories ───────────────────────────────────────────────────────────
-
-def _btn(parent, text, command, bg, fg, active_bg, width=14, **kw):
-    return tk.Button(
-        parent, text=text, command=command,
-        bg=bg, fg=fg, activebackground=active_bg, activeforeground=fg,
-        relief=tk.FLAT, padx=10, pady=6,
-        font=FONT_BODY, cursor="hand2", width=width, **kw,
-    )
-
-def primary_btn(parent, text, command=None, width=14, **kw):
-    return _btn(parent, text, command, ACCENT2, FG, "#388bfd", width, **kw)
-
-def success_btn(parent, text, command=None, width=14, **kw):
-    return _btn(parent, text, command, ACCENT, FG, "#2ea043", width, **kw)
-
-def danger_btn(parent, text, command=None, width=14, **kw):
-    return _btn(parent, text, command, "#b91c1c", FG, "#dc2626", width, **kw)
-
-
-# ── Label helpers ──────────────────────────────────────────────────────────────
-
-def section_label(parent, text: str, **kw) -> tk.Label:
-    return tk.Label(parent, text=text, font=FONT_TITLE,
-                    fg=FG, bg=BG2, **kw)
-
-def info_label(parent, text: str, color: str = FG_MUTED, **kw) -> tk.Label:
-    return tk.Label(parent, text=text, font=FONT_LABEL,
-                    fg=color, bg=parent.cget("bg"),
-                    wraplength=700, justify=tk.LEFT, **kw)
-
-
-# ── Live camera preview widget ─────────────────────────────────────────────────
-
-class CameraPreview(tk.Frame):
-    """
-    Displays a continuously updated camera frame inside a Label widget.
-
-    Call start(source_fn) to begin pulling frames, stop() to halt.
-    source_fn is a callable that returns an Optional[np.ndarray].
-    """
-
-    def __init__(self, parent, label: str = "", width: int = 320, height: int = 240, **kw):
-        kw.setdefault("bg", BG2)
-        super().__init__(parent, **kw)
-
-        self._width  = width
-        self._height = height
-        self._after_id  = None
-        self._source_fn: Optional[Callable] = None
-        self._tk_img    = None
-
-        tk.Label(self, text=label, font=FONT_LABEL, fg=FG_MUTED, bg=BG2).pack()
-        self._lbl = tk.Label(self, bg="#000", width=width, height=height)
-        self._lbl.pack(padx=4, pady=4)
-        self._status_lbl = tk.Label(self, text="", font=FONT_LABEL,
-                                    fg=FG_MUTED, bg=BG2)
-        self._status_lbl.pack()
-
-    def start(self, source_fn: Callable):
-        self._source_fn = source_fn
-        self._tick()
-
-    def stop(self):
-        if self._after_id:
-            try:
-                self.after_cancel(self._after_id)
-            except Exception:
-                pass
-            self._after_id = None
-
-    def set_label(self, text: str):
-        # Update the top label of the preview
-        for widget in self.winfo_children():
-            if isinstance(widget, tk.Label) and widget is not self._lbl and widget is not self._status_lbl:
-                widget.configure(text=text)
-                break
-
-    def set_status(self, text: str, color: str = FG_MUTED):
-        self._status_lbl.configure(text=text, fg=color)
-
-    def _tick(self):
-        if self._source_fn:
-            frame = self._source_fn()
-            if frame is not None:
-                # Pass self._lbl as master so the PhotoImage is bound to the
-                # correct Tk interpreter — prevents "pyimage doesn't exist"
-                # errors when multiple Tk roots exist (e.g. Spyder/IPython).
-                tk_img = frame_to_tk(frame, self._width, self._height,
-                                     master=self._lbl)
-                self._lbl.configure(image=tk_img)
-                self._lbl.image = tk_img
-                self._tk_img    = tk_img
-        self._after_id = self.after(33, self._tick)   # ~30 fps
-
-
-# ── Image conversion utility ───────────────────────────────────────────────────
-
-def frame_to_tk(
-    frame:    np.ndarray,
-    target_w: int,
-    target_h: int,
-    master:   object = None,
-) -> ImageTk.PhotoImage:
-    """
-    Convert an OpenCV BGR frame to a Tkinter-compatible PhotoImage,
-    scaling it to fit within target_w × target_h while preserving aspect ratio.
-
-    Pass master=<some_widget> to bind the PhotoImage to the correct Tk
-    interpreter.  Required when multiple Tk roots may exist (Spyder / IPython).
-    """
+def cv2_to_photo(frame: np.ndarray, max_w: int, max_h: int):
+    """Return (PhotoImage, scale) where scale maps original->displayed pixels."""
     h, w = frame.shape[:2]
-    scale = min(target_w / w, target_h / h)
-    nw, nh = int(w * scale), int(h * scale)
+    scale = min(max_w / w, max_h / h)
+    disp = cv2.resize(frame, (max(1, int(w * scale)), max(1, int(h * scale))))
+    rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
+    photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+    return photo, scale
 
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    pil = Image.fromarray(rgb).resize((nw, nh), Image.BILINEAR)
-    return ImageTk.PhotoImage(image=pil, master=master)
+
+class VideoPanel(ttk.Label):
+    """A label that displays OpenCV frames.  Call show(frame) from the main thread."""
+
+    def __init__(self, master, max_w=480, max_h=360, **kw):
+        super().__init__(master, **kw)
+        self.max_w, self.max_h = max_w, max_h
+        self._photo = None
+        self.configure(anchor="center")
+
+    def show(self, frame: Optional[np.ndarray], placeholder: str = "no signal"):
+        if frame is None:
+            self.configure(image="", text=placeholder, foreground=MUTED)
+            self._photo = None
+            return
+        self._photo, _ = cv2_to_photo(frame, self.max_w, self.max_h)
+        self.configure(image=self._photo, text="")
+
+
+class ClickableImage(tk.Canvas):
+    """
+    Displays a static image scaled to fit, and records left-clicks as numbered
+    points.  Clicks are stored and reported in ORIGINAL image-pixel coordinates.
+    Right-click removes the last point.
+    """
+
+    def __init__(self, master, max_w=560, max_h=560, on_change: Optional[Callable] = None, **kw):
+        super().__init__(master, width=max_w, height=max_h, bg=PANEL,
+                         highlightthickness=1, highlightbackground="#30363d", **kw)
+        self.max_w, self.max_h = max_w, max_h
+        self._img_photo = None
+        self._scale = 1.0
+        self._offx = self._offy = 0
+        self._points: List[Tuple[float, float]] = []     # original-pixel coords
+        self._predicted: List[Tuple[float, float]] = []   # DLT-reprojected fiducials
+        self._orig_size = (0, 0)
+        self._on_change = on_change
+        self.bind("<Button-1>", self._add_point)
+        self.bind("<Button-3>", self._remove_last)
+
+    def set_image(self, bgr: np.ndarray):
+        h, w = bgr.shape[:2]
+        self._orig_size = (w, h)
+        self._scale = min(self.max_w / w, self.max_h / h)
+        dw, dh = int(w * self._scale), int(h * self._scale)
+        self._offx = (self.max_w - dw) // 2
+        self._offy = (self.max_h - dh) // 2
+        disp = cv2.resize(bgr, (dw, dh))
+        rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
+        self._img_photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+        self._redraw()
+
+    def clear_points(self):
+        self._points.clear()
+        self._redraw()
+        self._notify()
+
+    @property
+    def points(self) -> List[Tuple[float, float]]:
+        return list(self._points)
+
+    def set_points(self, pts: List[Tuple[float, float]]):
+        self._points = [tuple(map(float, p)) for p in pts]
+        self._redraw()
+
+    def set_predicted(self, pts: List[Tuple[float, float]]):
+        """Overlay DLT-reprojected fiducials (red crosses) for the registration check."""
+        self._predicted = [tuple(map(float, p)) for p in pts]
+        self._redraw()
+
+    # ---- internals ---------------------------------------------------------
+    def _add_point(self, event):
+        if self._img_photo is None:
+            return
+        ox = (event.x - self._offx) / self._scale
+        oy = (event.y - self._offy) / self._scale
+        w, h = self._orig_size
+        if 0 <= ox <= w and 0 <= oy <= h:
+            self._points.append((ox, oy))
+            self._redraw()
+            self._notify()
+
+    def _remove_last(self, _event):
+        if self._points:
+            self._points.pop()
+            self._redraw()
+            self._notify()
+
+    def _notify(self):
+        if self._on_change:
+            self._on_change()
+
+    def _redraw(self):
+        self.delete("all")
+        if self._img_photo is not None:
+            self.create_image(self._offx, self._offy, anchor="nw", image=self._img_photo)
+        for i, (ox, oy) in enumerate(self._points, start=1):
+            x = self._offx + ox * self._scale
+            y = self._offy + oy * self._scale
+            r = 6
+            self.create_oval(x - r, y - r, x + r, y + r, outline=ACCENT, width=2)
+            self.create_text(x + 10, y - 10, text=str(i), fill=ACCENT,
+                             font=("Segoe UI", 10, "bold"))
+        # registration-check crosses: where the saved DLT predicts each fiducial
+        for (ox, oy) in self._predicted:
+            if not (np.isfinite(ox) and np.isfinite(oy)):
+                continue
+            x = self._offx + ox * self._scale
+            y = self._offy + oy * self._scale
+            r = 7
+            self.create_line(x - r, y, x + r, y, fill=BAD, width=2)
+            self.create_line(x, y - r, x, y + r, fill=BAD, width=2)
+
+
+class StatusChip(ttk.Frame):
+    """A coloured dot + label that reflects a ready / not-ready state."""
+
+    def __init__(self, master, text: str, **kw):
+        super().__init__(master, **kw)
+        self._canvas = tk.Canvas(self, width=14, height=14, highlightthickness=0, bg=BG)
+        self._dot = self._canvas.create_oval(2, 2, 12, 12, fill=BAD, outline="")
+        self._canvas.pack(side="left", padx=(0, 6))
+        self._label = ttk.Label(self, text=text)
+        self._label.pack(side="left")
+
+    def set_state(self, ready: bool, text: Optional[str] = None):
+        self._canvas.itemconfigure(self._dot, fill=OK if ready else BAD)
+        if text is not None:
+            self._label.configure(text=text)

@@ -1,111 +1,85 @@
 """
-FluoroSim v2 — Global configuration.
+config.py  —  FluoroSim physical constants and tolerances
+============================================================
 
-All physical measurements are in millimetres.
+Every hard number that describes the *physical* hardware lives here, so the
+rest of the code never hard-codes a millimetre value.  These match the printed
+ChArUco board and the ArUco probe cube you are already using — do not change
+them unless you reprint the markers.
 
-Coordinate systems
-──────────────────
-Probe cube   : origin at cube centre.
-               +Z = rod-exit face (ID 0, FRONT).  +Y = top face (ID 4).
-               The K-wire tip is 100 mm beyond the +Z face surface.
+Coordinate convention (MODEL space, a.k.a. board space)
+-------------------------------------------------------
+The platform ChArUco board defines the model coordinate frame:
 
-Model/Board  : origin at the bottom-left corner of the CharucoBoard
-               (as seen when facing the cranial wall of the platform).
-               +X = rightward across board width.
-               +Y = upward along board height.
-               +Z = out of the board face (toward the cameras).
-               All X-ray fiducial coordinates must be measured from this origin.
+    origin  : bottom-left inner corner of the board, as it sits on the platform
+    +X      : along the long (126 mm) edge of the board   -> "across"
+    +Y      : along the short (72 mm) edge of the board    -> "up the platform"
+    +Z      : out of the board face, toward the cameras
+    units   : millimetres, everywhere
+
+All fiducial (steel-bearing) coordinates and the calibration-hole coordinate
+are expressed in this same frame.  That shared origin is the single most
+important consistency requirement in the whole system.
 """
 
 import cv2
 import numpy as np
 
-# ── ArUco dictionaries ─────────────────────────────────────────────────────────
-# Two separate dictionaries eliminate any ID collision between probe and board.
-PROBE_ARUCO_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-BOARD_ARUCO_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_50)
+APP_NAME = "FluoroSim"
 
-# ── Probe cube geometry ────────────────────────────────────────────────────────
-CUBE_SIDE_MM   = 40.0   # printed cube side length
-MARKER_SIZE_MM = 32.0   # printed ArUco marker size on each face (0.8 × side)
-ROD_LENGTH_MM  = 100.0  # K-wire length from +Z face surface to tip
+# ── Platform ChArUco board ──────────────────────────────────────────────────
+# 7 columns x 4 rows, landscape.  (cols, rows) MUST match the printed board or
+# the detector finds zero corners and the board never registers.
+CHARUCO_DICT      = cv2.aruco.DICT_5X5_50
+CHARUCO_COLS      = 7        # squares across  -> board width  = 7 * 18 = 126 mm  (+X)
+CHARUCO_ROWS      = 4        # squares tall    -> board height = 4 * 18 =  72 mm  (+Y)
+CHARUCO_SQUARE_MM = 18.0     # chessboard square edge
+CHARUCO_MARKER_MM = 14.4     # ArUco marker edge inside each square (0.80 x square)
 
-_h = MARKER_SIZE_MM / 2.0   # 16 mm — half marker
-_s = CUBE_SIDE_MM   / 2.0   # 20 mm — half cube
-
-# 3-D corners of each marker face in cube-local space.
-# OpenCV ArUco convention: top-left → top-right → bottom-right → bottom-left.
-# "Top" of each marker points toward +Y (face 4) EXCEPT faces 4 and 5
-# whose top edges point toward face 0 (+Z).
-CUBE_FACE_OBJ_PTS: dict[int, np.ndarray] = {
-    # ID 0  +Z  FRONT  — rod exits here (most critical)
-    0: np.array([[-_h,  _h,  _s], [ _h,  _h,  _s],
-                 [ _h, -_h,  _s], [-_h, -_h,  _s]], np.float32),
-    # ID 1  -Z  BACK
-    1: np.array([[ _h,  _h, -_s], [-_h,  _h, -_s],
-                 [-_h, -_h, -_s], [ _h, -_h, -_s]], np.float32),
-    # ID 2  +X  RIGHT
-    2: np.array([[ _s,  _h,  _h], [ _s,  _h, -_h],
-                 [ _s, -_h, -_h], [ _s, -_h,  _h]], np.float32),
-    # ID 3  -X  LEFT
-    3: np.array([[-_s,  _h, -_h], [-_s,  _h,  _h],
-                 [-_s, -_h,  _h], [-_s, -_h, -_h]], np.float32),
-    # ID 4  +Y  TOP  (cranial camera sees this most during training)
-    4: np.array([[-_h,  _s, -_h], [ _h,  _s, -_h],
-                 [ _h,  _s,  _h], [-_h,  _s,  _h]], np.float32),
-    # ID 5  -Y  BOTTOM
-    5: np.array([[-_h, -_s,  _h], [ _h, -_s,  _h],
-                 [ _h, -_s, -_h], [-_h, -_s, -_h]], np.float32),
-}
-
-# Rod geometry in cube-local space (rod exits +Z face)
-ROD_BASE_IN_CUBE = np.array([0.0, 0.0,  _s],                    np.float32)
-ROD_TIP_IN_CUBE  = np.array([0.0, 0.0,  _s + ROD_LENGTH_MM],    np.float32)
-
-# ── Platform CharucoBoard ──────────────────────────────────────────────────────
-# Mounted on the cranial face of the platform: 80 mm tall × 140 mm wide.
-# A 4-column × 7-row grid of 18 mm squares → board size 72 × 126 mm.
-# Fits inside 80 × 140 mm with clean 4 mm margins on all sides.
-CHARUCO_COLS      = 4       # squares across (X direction)
-CHARUCO_ROWS      = 7       # squares tall   (Y direction)
-CHARUCO_SQUARE_MM = 18.0    # physical size of each chessboard square
-CHARUCO_MARKER_MM = 13.0    # ArUco marker inside each square (~0.72 × square)
-
-# Minimum Charuco inner corners required to accept a pose estimate.
-# 4 is the mathematical minimum for solvePnP; 6 adds robustness.
+# Minimum interpolated ChArUco corners before we trust a board pose.
 MIN_CHARUCO_CORNERS = 6
 
-# ── Calibration slot ──────────────────────────────────────────────────────────
-# Single slot on the cranial wall, top-entry. Probe inserts 40 mm into the slot.
-# Used only as a defined starting position for the trainee — not a computational step.
-SLOT_DEPTH_MM = 40.0
+# ── ArUco probe cube ────────────────────────────────────────────────────────
+PROBE_DICT      = cv2.aruco.DICT_4X4_50
+PROBE_IDS       = (0, 1, 2, 3, 4, 5)   # one marker per cube face
+CUBE_SIDE_MM    = 40.0                 # outer edge of the white PETG cube
+PROBE_MARKER_MM = 32.0                 # printed marker edge on each face
 
-# ── Intrinsic camera calibration ──────────────────────────────────────────────
-CHECKERBOARD_COLS      = 9      # inner corner count (columns)
-CHECKERBOARD_ROWS      = 6      # inner corner count (rows)
-CHECKERBOARD_SQ_MM     = 25.0   # physical square size
-INTRINSIC_CALIB_FRAMES = 20     # checkerboard frames to collect before computing
+# Rod / K-wire geometry, expressed in CUBE-LOCAL coordinates.
+# Cube centre is the origin; +Z exits the FRONT face (marker ID 0).
+ROD_EXIT_FACE_ID = 0
+ROD_BASE_IN_CUBE = np.array([0.0, 0.0,  CUBE_SIDE_MM / 2.0],          dtype=np.float64)  # (0,0, 20)
+ROD_LENGTH_MM    = 100.0
+ROD_TIP_IN_CUBE  = np.array([0.0, 0.0,  CUBE_SIDE_MM / 2.0 + ROD_LENGTH_MM], dtype=np.float64)  # (0,0,120)
 
-# ── Navigation / display ──────────────────────────────────────────────────────
-PREVIEW_W          = 640
-PREVIEW_H          = 480
-XRAY_DISPLAY_W     = 480
-XRAY_DISPLAY_H     = 600
-NAV_UPDATE_MS      = 100    # 10 fps overlay refresh (real-time mode)
-NAV_REALTIME       = True   # default to real-time on launch
+# ── Calibration / verification hole ─────────────────────────────────────────
+# A drilled hole on the platform at a *known* model-space coordinate.  Insert
+# the probe tip fully into it; the system should report the tip at this point.
+# This is a property of YOUR platform — measure it once and set it here (it can
+# also be edited and saved from the Cameras screen).
+CALIB_HOLE_MODEL_MM = np.array([63.0, 36.0, 0.0], dtype=np.float64)  # placeholder: board centre, on the face
 
-OVERLAY_COLOR_TIP    = (  0, 255,   0)   # green  — K-wire tip dot
-OVERLAY_COLOR_SHAFT  = (  0, 200, 255)   # cyan   — shaft trajectory line
-OVERLAY_THICKNESS    = 3
-OVERLAY_TIP_RADIUS   = 10
-OVERLAY_SHAFT_EXTEND = 60    # mm to extend shaft line beyond tip for readability
+# ── Tolerances (your stated targets) ────────────────────────────────────────
+TIP_ERROR_TOLERANCE_MM   = 5.0   # max acceptable tip error at the calibration hole
+CAMERA_AGREEMENT_TOL_MM  = 5.0   # max acceptable disagreement between the two cameras
+TRAJECTORY_ANGLE_TOL_DEG = 5.0
+DLT_REPROJ_WARN_PX       = 2.0   # warn if X-ray fiducial reprojection exceeds this
 
-# ── Paths ──────────────────────────────────────────────────────────────────────
-DATA_DIR    = "data"
-MODELS_DIR  = f"{DATA_DIR}/models"
-CAMERAS_DIR = f"{DATA_DIR}/cameras"
+# ── Intrinsic calibration ───────────────────────────────────────────────────
+MIN_CALIB_VIEWS = 8       # minimum board captures for a usable lens calibration
+GOOD_CALIB_RMS  = 1.0     # px; calibration RMS below this is "good"
 
-# ── Application ────────────────────────────────────────────────────────────────
-APP_TITLE   = "FluoroSim — Simulated Fluoroscopy Training System"
-APP_VERSION = "2.0.0"
-MAX_CAMERAS = 8
+# ── Cameras and X-ray views (these are INDEPENDENT) ──────────────────────────
+# The two tracking CAMERAS and the two X-RAY VIEWS are decoupled on purpose.
+# The cameras exist only to fix the probe's position in 3-D model space; their
+# physical angles can be anything that gives a good solve (head-on + 45 deg is a
+# fine, ergonomic choice).  Each X-ray is then projected through ITS OWN matrix,
+# fitted from the bearings clicked on that image -- so the X-rays can be a TRUE
+# AP and a TRUE lateral, no matter where the webcams sit.  A camera at 45 deg
+# does NOT need to "look like" the lateral view.
+#
+# The two share the same internal keys ("ap", "lat") purely for storage; the
+# labels below keep the two ideas distinct in the UI.
+CAMERA_ROLES = ("ap", "lat")
+ROLE_LABEL   = {"ap": "Camera 1 (head-on)", "lat": "Camera 2 (45 deg oblique)"}
+XRAY_LABEL   = {"ap": "AP", "lat": "Lateral"}

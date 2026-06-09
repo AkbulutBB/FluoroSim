@@ -1,1 +1,1 @@
-# ui package
+"""FluoroSim UI package."""
