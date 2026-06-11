@@ -31,6 +31,8 @@ from core.geometry import RigidTransform
 class BoardPose:
     transform: RigidTransform
     n_corners: int
+    rvec: np.ndarray
+    tvec: np.ndarray
 
 
 class BoardTracker:
@@ -57,7 +59,8 @@ class BoardTracker:
         if not ok:
             return None
         # solvePnP gives MODEL->CAMERA; from_model_to_camera inverts it for us.
-        return BoardPose(RigidTransform.from_model_to_camera(rvec, tvec), int(len(ch_ids)))
+        return BoardPose(RigidTransform.from_model_to_camera(rvec, tvec), int(len(ch_ids)),
+                         np.asarray(rvec, float), np.asarray(tvec, float))
 
 
 # ── Probe cube ─────────────────────────────────────────────────────────────—
@@ -97,20 +100,18 @@ class ProbeTracker:
         obj_pts = np.vstack(obj_list).astype(np.float64)
         img_pts = np.vstack(img_list).astype(np.float64)
 
-        if len(faces) == 1:
-            # Single square: IPPE_SQUARE is the most stable minimal solver.
+        # SQPNP handles our (non-canonical) cube-face object points correctly for
+        # any face count; IPPE_SQUARE assumes a marker centred at the origin and
+        # is wrong for our geometry (~20 mm tip error vs ~0.3 mm).  We then refine
+        # with an iterative solve.  Note: a *single* face is still geometrically
+        # ambiguous (it can tilt toward or away), so two faces, or fusion across
+        # the two cameras, is what makes the tip trustworthy.
+        ok, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, mtx, dist,
+                                      flags=cv2.SOLVEPNP_SQPNP)
+        if ok:
             ok, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, mtx, dist,
-                                          flags=cv2.SOLVEPNP_IPPE_SQUARE)
-        else:
-            # Several faces (typical of the oblique camera): solve jointly, then
-            # refine.  With a 100 mm rod this cuts tip error by ~50x vs one face.
-            ok, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, mtx, dist,
-                                          flags=cv2.SOLVEPNP_SQPNP)
-            if ok:
-                ok, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, mtx, dist,
-                                              rvec=rvec, tvec=tvec,
-                                              useExtrinsicGuess=True,
-                                              flags=cv2.SOLVEPNP_ITERATIVE)
+                                          rvec=rvec, tvec=tvec, useExtrinsicGuess=True,
+                                          flags=cv2.SOLVEPNP_ITERATIVE)
         if not ok:
             return None
 
@@ -160,3 +161,31 @@ def _as_gray(frame: np.ndarray) -> np.ndarray:
     if frame.ndim == 2:
         return frame
     return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+
+# ── diagnostic drawing ───────────────────────────────────────────────────────
+def draw_board_pose(frame, board: BoardPose, mtx, dist, axis_len=30.0):
+    """Draw the board's model axes (X=red, Y=green, Z=blue) at its origin."""
+    try:
+        cv2.drawFrameAxes(frame, mtx, dist, board.rvec, board.tvec, axis_len, 2)
+    except cv2.error:
+        pass
+
+
+def draw_probe_pose(frame, obs: ProbeObservation, mtx, dist, axis_len=18.0):
+    """Draw the cube axes and the rod (base->tip) as the tracker sees them.
+    If the red rod line + dot land on the physical K-wire and its tip in the
+    image, the probe pose is correct.  If they point off in some other
+    direction, the cube pose is wrong (gluing / single-face ambiguity)."""
+    try:
+        cv2.drawFrameAxes(frame, mtx, dist, obs.rvec, obs.tvec, axis_len, 2)
+        pts = np.vstack([markers.ROD_BASE_IN_CUBE, markers.ROD_TIP_IN_CUBE]).astype(np.float64)
+        proj, _ = cv2.projectPoints(pts, obs.rvec, obs.tvec, mtx, dist)
+        p = proj.reshape(-1, 2)
+        if np.all(np.isfinite(p)):
+            a = tuple(np.round(p[0]).astype(int))
+            b = tuple(np.round(p[1]).astype(int))
+            cv2.line(frame, a, b, (0, 0, 255), 2, cv2.LINE_AA)
+            cv2.circle(frame, b, 6, (0, 0, 255), -1, cv2.LINE_AA)
+    except cv2.error:
+        pass

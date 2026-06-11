@@ -2,23 +2,18 @@
 ui/screen_sim.py  —  Simulated fluoroscopy
 ===========================================
 
-Every frame:
+Every frame: each camera finds the board (-> camera->model transform) and the
+probe cube (-> rod tip/base in camera space); the rod endpoints are carried into
+model space, the cameras fused, and the fused tip/trajectory projected through
+each X-ray's saved DLT matrix and drawn over the stored images.
 
-  * each camera finds the board (-> camera->model transform) and the probe cube
-    (-> rod tip/base in camera space);
-  * the rod endpoints are carried into model space and the cameras fused;
-  * the fused tip and trajectory are projected through each X-ray's saved DLT
-    matrix and drawn over the stored AP and lateral images.
+Decoupling: the bottom feeds are TRACKING cameras (any angle that gives a good
+solve); the big panels are the X-ray VIEWS (true AP, true lateral), each with
+its own matrix.  Camera angle and X-ray view are independent.
 
-IMPORTANT decoupling: the two camera feeds (bottom) are only there to fix the
-probe in 3-D.  The two big panels are the X-ray VIEWS (true AP, true lateral),
-each projected through its own matrix.  Camera angle and X-ray view are
-independent -- a 45 deg camera still feeds a true-lateral overlay.
-
-The live feeds are annotated: green boxes = ChArUco (board) markers, orange
-boxes = probe-cube markers.  If you see no orange box on the cube, the probe is
-not being detected (lighting / focus / distance / angle), which is why no
-overlay appears -- fix that first.
+Feeds are annotated for diagnosis: green = board markers, orange = probe-cube
+markers, RGB axes = solved poses, red line+dot = the rod the tracker computed.
+If the red rod doesn't sit on the physical K-wire, the probe pose is wrong.
 """
 
 from __future__ import annotations
@@ -31,7 +26,8 @@ import numpy as np
 import config
 from core import markers
 from core.camera_io import CameraStream
-from core.tracking import BoardTracker, ProbeTracker, fuse_model_points
+from core.tracking import (BoardTracker, ProbeTracker, fuse_model_points,
+                           draw_board_pose, draw_probe_pose)
 from ui.app import Screen
 from ui import widgets as W
 
@@ -45,14 +41,12 @@ class SimulationScreen(Screen):
         self._tick_id = None
         self._board_tracker = BoardTracker()
         self._probe_tracker = ProbeTracker()
-        # lightweight detectors used only to draw boxes on the feeds
         self._board_aruco = cv2.aruco.ArucoDetector(markers.CHARUCO_DICTIONARY)
         self._probe_aruco = markers.make_aruco_detector()
         self._xray = {r: None for r in config.CAMERA_ROLES}
 
         self._build_header()
 
-        # main output: the two X-ray views with overlay
         out = ttk.Frame(self, style="App.TFrame")
         out.pack(fill="both", expand=True, padx=16, pady=(0, 8))
         self.xray_panel = {}
@@ -67,7 +61,6 @@ class SimulationScreen(Screen):
         out.columnconfigure(0, weight=1)
         out.columnconfigure(1, weight=1)
 
-        # footer: small live feeds + status
         foot = ttk.Frame(self, style="App.TFrame")
         foot.pack(fill="x", padx=16, pady=(0, 12))
         self.feed = {}
@@ -87,9 +80,8 @@ class SimulationScreen(Screen):
         ttk.Button(bar, text="\u2190 Home", command=lambda: self.app.show("home")).pack(side="left")
         ttk.Label(bar, text="Simulation", style="H2.TLabel").pack(side="left", padx=14)
 
-    # ── feed annotation (diagnostic) ─────────────────────────────────────────
+    # ── feed annotation ───────────────────────────────────────────────────────
     def _annotate(self, frame):
-        """Draw detected board (green) and probe (orange) markers; return counts."""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         n_board = n_probe = 0
         bc, bids, _ = self._board_aruco.detectMarkers(gray)
@@ -109,7 +101,6 @@ class SimulationScreen(Screen):
         if not np.all(np.isfinite(p)):
             return None
         h, w = shape[:2]
-        # reject wildly off-image projections (symptom of a bad DLT / coords)
         if not (-2 * w <= p[0] <= 3 * w and -2 * h <= p[1] <= 3 * h):
             return None
         return tuple(p.astype(int))
@@ -121,8 +112,8 @@ class SimulationScreen(Screen):
         if pb is None or pt is None:
             return img, False
         cv2.line(img, pb, pt, (60, 220, 60), 3, cv2.LINE_AA)
-        cv2.circle(img, pb, 7, (40, 200, 255), 2, cv2.LINE_AA)      # entry (yellow)
-        cv2.circle(img, pt, 8, (60, 60, 240), -1, cv2.LINE_AA)      # tip (red)
+        cv2.circle(img, pb, 7, (40, 200, 255), 2, cv2.LINE_AA)
+        cv2.circle(img, pt, 8, (60, 60, 240), -1, cv2.LINE_AA)
         cv2.circle(img, pt, 8, (255, 255, 255), 1, cv2.LINE_AA)
         return img, True
 
@@ -148,7 +139,11 @@ class SimulationScreen(Screen):
                 probe_used[r] = probe.n_faces
                 tips.append(board.transform.apply(probe.rod_tip_cam))
                 bases.append(board.transform.apply(probe.rod_base_cam))
-            _, probe_markers[r] = self._annotate(frame)   # draw boxes for diagnosis
+            _, probe_markers[r] = self._annotate(frame)
+            if board is not None:
+                draw_board_pose(frame, board, intr.mtx, intr.dist)
+            if board is not None and probe is not None:
+                draw_probe_pose(frame, probe, intr.mtx, intr.dist)
             self.feed[r].show(frame)
 
         fused = fuse_model_points(tips, bases) if tips else None
@@ -183,8 +178,7 @@ class SimulationScreen(Screen):
             lines.append(f"{config.ROLE_LABEL[r]}: {b}, {f}")
         if fused is not None:
             t = fused.tip_model
-            lines.append(f"tip(model): [{t[0]:.0f}, {t[1]:.0f}, {t[2]:.0f}] mm "
-                         f"({fused.n_cameras} cam)")
+            lines.append(f"tip(model): [{t[0]:.0f}, {t[1]:.0f}, {t[2]:.0f}] mm ({fused.n_cameras} cam)")
             if fused.agreement_mm is not None:
                 tag = "" if fused.agreement_mm <= config.CAMERA_AGREEMENT_TOL_MM else "  \u26a0 high"
                 lines.append(f"agreement: {fused.agreement_mm:.1f} mm{tag}")

@@ -27,7 +27,9 @@ import config
 from core import paths
 from core.camera_io import CameraStream, list_available_cameras
 from core.intrinsics import CharucoCalibrator, CameraIntrinsics
-from core.tracking import BoardTracker, ProbeTracker, fuse_model_points
+from core.tracking import (BoardTracker, ProbeTracker, fuse_model_points,
+                           draw_board_pose, draw_probe_pose)
+from core import markers
 from ui.app import Screen
 from ui import widgets as W
 
@@ -43,6 +45,7 @@ class CamerasScreen(Screen):
         self._calibrators: dict = {r: CharucoCalibrator() for r in config.CAMERA_ROLES}
         self._board_tracker = BoardTracker()
         self._probe_tracker = ProbeTracker()
+        self._probe_aruco = markers.make_aruco_detector()
         self._calib_role = config.CAMERA_ROLES[0]
         self._available = []
 
@@ -262,8 +265,8 @@ class CamerasScreen(Screen):
         self._tick_id = self.after(40, self._tick)
 
     def _tick_verify(self):
-        tips, bases = [], []
-        per_cam = {}
+        tips, bases, centers = [], [], []
+        per = {}   # role -> (cube_center_model, tip_model, n_faces)
         for r in config.CAMERA_ROLES:
             stream = self.streams.get(r)
             intr = self.session.intrinsics.get(r)
@@ -274,28 +277,46 @@ class CamerasScreen(Screen):
             board = self._board_tracker.estimate(frame, intr.mtx, intr.dist)
             probe = self._probe_tracker.estimate(frame, intr.mtx, intr.dist)
             disp = frame.copy()
+            # show that the cube is at least *detected* (orange boxes)
+            pc, pids, _ = self._probe_aruco.detectMarkers(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+            if pids is not None:
+                cv2.aruco.drawDetectedMarkers(disp, pc, pids, (40, 160, 255))
+            if board is not None:
+                draw_board_pose(disp, board, intr.mtx, intr.dist)
             if board is not None and probe is not None:
-                tip_m = board.transform.apply(probe.rod_tip_cam)
-                base_m = board.transform.apply(probe.rod_base_cam)
-                tips.append(tip_m); bases.append(base_m)
-                per_cam[r] = tip_m
+                draw_probe_pose(disp, probe, intr.mtx, intr.dist)
+                tip_m    = board.transform.apply(probe.rod_tip_cam)
+                base_m   = board.transform.apply(probe.rod_base_cam)
+                center_m = board.transform.apply(probe.tvec.flatten())
+                tips.append(tip_m); bases.append(base_m); centers.append(center_m)
+                per[r] = (center_m, tip_m, probe.n_faces)
             self.verify_video[r].show(disp)
+
+        def fmt(v):
+            return f"[{v[0]:.0f}, {v[1]:.0f}, {v[2]:.0f}]"
+
+        lines = []
+        for r in config.CAMERA_ROLES:
+            short = config.ROLE_LABEL[r].split(" (")[0]
+            if r in per:
+                c, t, nf = per[r]
+                lines.append(f"{short}: {nf}f  cube {fmt(c)}  tip {fmt(t)}")
+            else:
+                lines.append(f"{short}: probe not solved")
 
         if len(tips) >= 1:
             fused = fuse_model_points(tips, bases)
             hole = self._hole_xyz()
             err = float(np.linalg.norm(fused.tip_model - hole))
             self._last_error = err if fused.n_cameras == 2 else None
-            lines = [f"Measured tip (model): "
-                     f"[{fused.tip_model[0]:.1f}, {fused.tip_model[1]:.1f}, {fused.tip_model[2]:.1f}] mm",
-                     f"Known hole         : [{hole[0]:.1f}, {hole[1]:.1f}, {hole[2]:.1f}] mm",
-                     f"Tip error          : {err:.1f} mm   (target \u2264 {config.TIP_ERROR_TOLERANCE_MM:.0f} mm)",
-                     f"Cameras used       : {fused.n_cameras}/2"]
-            if fused.agreement_mm is not None:
-                lines.append(f"Camera agreement   : {fused.agreement_mm:.1f} mm")
-            self.verify_readout.configure(text="\n".join(lines))
+            lines.append(f"known hole {fmt(hole)}   tip error {err:.0f} mm "
+                         f"(target \u2264 {config.TIP_ERROR_TOLERANCE_MM:.0f})")
+            if len(centers) == 2:
+                lines.append(f"cube-centre agreement {np.linalg.norm(centers[0]-centers[1]):.0f} mm   "
+                             f"|  tip agreement {fused.agreement_mm:.0f} mm")
             ready = fused.n_cameras == 2 and err <= config.TIP_ERROR_TOLERANCE_MM
             self.btn_mark.state(["!disabled"] if ready else ["disabled"])
+            self.verify_readout.configure(text="\n".join(lines))
         else:
             self._last_error = None
             self.verify_readout.configure(

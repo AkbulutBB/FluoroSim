@@ -142,8 +142,7 @@ class ModelScreen(Screen):
 
     def _check_registration(self):
         """Fit a DLT from the current clicks and overlay where it predicts each
-        fiducial (red x).  If every x lands on its blue circle, the registration
-        is good; scattered x's mean a mis-click or a wrong coordinate."""
+        fiducial (red x).  Every x on its blue circle = good registration."""
         from core.dlt import ProjectionMatrix
         try:
             fids = self._parse_fiducials()
@@ -166,8 +165,7 @@ class ModelScreen(Screen):
             except Exception as exc:  # noqa: BLE001
                 msgs.append(f"{config.XRAY_LABEL[r]}: DLT failed ({exc})")
                 continue
-            pred = P.project(fids)
-            self.canvas[r].set_predicted(pred.tolist())
+            self.canvas[r].set_predicted(P.project(fids).tolist())
             err = P.reprojection_error(fids, np.asarray(clicks, float))
             flag = "" if err <= config.DLT_REPROJ_WARN_PX else "  (high)"
             msgs.append(f"{config.XRAY_LABEL[r]}: mean error {err:.2f} px{flag}")

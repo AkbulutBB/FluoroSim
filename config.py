@@ -72,14 +72,9 @@ GOOD_CALIB_RMS  = 1.0     # px; calibration RMS below this is "good"
 # ── Cameras and X-ray views (these are INDEPENDENT) ──────────────────────────
 # The two tracking CAMERAS and the two X-RAY VIEWS are decoupled on purpose.
 # The cameras exist only to fix the probe's position in 3-D model space; their
-# physical angles can be anything that gives a good solve (head-on + 45 deg is a
-# fine, ergonomic choice).  Each X-ray is then projected through ITS OWN matrix,
-# fitted from the bearings clicked on that image -- so the X-rays can be a TRUE
-# AP and a TRUE lateral, no matter where the webcams sit.  A camera at 45 deg
-# does NOT need to "look like" the lateral view.
-#
-# The two share the same internal keys ("ap", "lat") purely for storage; the
-# labels below keep the two ideas distinct in the UI.
+# physical angles can be anything that gives a good solve.  Each X-ray is then
+# projected through ITS OWN matrix -- so the X-rays can be a TRUE AP and a TRUE
+# lateral no matter where the webcams sit.
 CAMERA_ROLES = ("ap", "lat")
 ROLE_LABEL   = {"ap": "Camera 1 (head-on)", "lat": "Camera 2 (45 deg oblique)"}
 XRAY_LABEL   = {"ap": "AP", "lat": "Lateral"}
