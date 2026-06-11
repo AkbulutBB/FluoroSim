@@ -22,13 +22,15 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 import numpy as np
+import cv2
 
 import config
 from core import paths
 from core.camera_io import CameraStream, list_available_cameras
 from core.intrinsics import CharucoCalibrator, CameraIntrinsics
-from core.tracking import (BoardTracker, ProbeTracker, fuse_model_points,
-                           draw_board_pose, draw_probe_pose)
+from core.tracking import (BoardTracker, ProbeTracker, CameraView,
+                           solve_probe_multiview, single_view_reproj,
+                           draw_board_pose, draw_probe_in_view)
 from core import markers
 from ui.app import Screen
 from ui import widgets as W
@@ -265,56 +267,70 @@ class CamerasScreen(Screen):
         self._tick_id = self.after(40, self._tick)
 
     def _tick_verify(self):
-        tips, bases, centers = [], [], []
-        per = {}   # role -> (cube_center_model, tip_model, n_faces)
+        views, view_roles, boards, frames = [], [], {}, {}
+        faces = {r: 0 for r in config.CAMERA_ROLES}
         for r in config.CAMERA_ROLES:
             stream = self.streams.get(r)
             intr = self.session.intrinsics.get(r)
             frame = stream.read() if stream else None
+            frames[r] = (frame, intr)
+            if frame is None or intr is None:
+                continue
+            board = self._board_tracker.estimate(frame, intr.mtx, intr.dist)
+            det = self._probe_tracker.detect(frame)
+            boards[r] = board
+            if det is not None:
+                faces[r] = det[2]
+            if board is not None and det is not None:
+                R_mc = cv2.Rodrigues(board.rvec)[0]
+                views.append(CameraView(R_mc, board.tvec.flatten(), intr.mtx, intr.dist,
+                                        det[0], det[1], det[2]))
+                view_roles.append(r)
+
+        mv = solve_probe_multiview(views) if views else None
+
+        for r in config.CAMERA_ROLES:
+            frame, intr = frames[r]
             if frame is None or intr is None:
                 self.verify_video[r].show(frame, "no signal / not calibrated")
                 continue
-            board = self._board_tracker.estimate(frame, intr.mtx, intr.dist)
-            probe = self._probe_tracker.estimate(frame, intr.mtx, intr.dist)
             disp = frame.copy()
-            # show that the cube is at least *detected* (orange boxes)
             pc, pids, _ = self._probe_aruco.detectMarkers(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
             if pids is not None:
                 cv2.aruco.drawDetectedMarkers(disp, pc, pids, (40, 160, 255))
-            if board is not None:
-                draw_board_pose(disp, board, intr.mtx, intr.dist)
-            if board is not None and probe is not None:
-                draw_probe_pose(disp, probe, intr.mtx, intr.dist)
-                tip_m    = board.transform.apply(probe.rod_tip_cam)
-                base_m   = board.transform.apply(probe.rod_base_cam)
-                center_m = board.transform.apply(probe.tvec.flatten())
-                tips.append(tip_m); bases.append(base_m); centers.append(center_m)
-                per[r] = (center_m, tip_m, probe.n_faces)
+            if boards.get(r) is not None:
+                draw_board_pose(disp, boards[r], intr.mtx, intr.dist)
+                if mv is not None:
+                    draw_probe_in_view(disp, mv, boards[r], intr.mtx, intr.dist)
             self.verify_video[r].show(disp)
 
         def fmt(v):
             return f"[{v[0]:.0f}, {v[1]:.0f}, {v[2]:.0f}]"
 
+        role_view = {vr: v for vr, v in zip(view_roles, views)}
         lines = []
         for r in config.CAMERA_ROLES:
-            short = config.ROLE_LABEL[r].split(" (")[0]
-            if r in per:
-                c, t, nf = per[r]
-                lines.append(f"{short}: {nf}f  cube {fmt(c)}  tip {fmt(t)}")
-            else:
-                lines.append(f"{short}: probe not solved")
+            short = config.ROLE_LABEL[r].split(' (')[0]
+            b = 'board OK' if boards.get(r) is not None else 'no board'
+            fit = ""
+            v = role_view.get(r)
+            if v is not None and v.n_faces >= 2:
+                e = single_view_reproj(v)
+                if e is not None:
+                    fit = f", fit {e:.1f}px"
+            lines.append(f"{short}: {b}, {faces[r]}f cube{fit}")
 
-        if len(tips) >= 1:
-            fused = fuse_model_points(tips, bases)
+        if mv is not None:
             hole = self._hole_xyz()
-            err = float(np.linalg.norm(fused.tip_model - hole))
-            self._last_error = err if fused.n_cameras == 2 else None
+            err = float(np.linalg.norm(mv.tip_model - hole))
+            self._last_error = err if mv.n_cameras == 2 else None
+            pc = "  ".join(f"{config.ROLE_LABEL[vr].split(' (')[0]} {e:.1f}px"
+                           for vr, e in zip(view_roles, mv.per_cam_reproj))
+            lines.append(f"tip {fmt(mv.tip_model)}   joint reproj {mv.reproj_px:.1f}px   ({pc})")
             lines.append(f"known hole {fmt(hole)}   tip error {err:.0f} mm "
                          f"(target \u2264 {config.TIP_ERROR_TOLERANCE_MM:.0f})")
-            if len(centers) == 2:
-                lines.append(f"cube-centre agreement {np.linalg.norm(centers[0]-centers[1]):.0f} mm   "
-                             f"|  tip agreement {fused.agreement_mm:.0f} mm")
-            ready = fused.n_cameras == 2 and err <= config.TIP_ERROR_TOLERANCE_MM
+            ready = (mv.n_cameras == 2 and err <= config.TIP_ERROR_TOLERANCE_MM
+                     and mv.reproj_px <= 4.0)
             self.btn_mark.state(["!disabled"] if ready else ["disabled"])
             self.verify_readout.configure(text="\n".join(lines))
         else:

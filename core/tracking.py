@@ -79,6 +79,25 @@ class ProbeTracker:
     def __init__(self):
         self._detector = markers.make_aruco_detector()
 
+    def detect(self, frame: np.ndarray):
+        """Return (obj_pts Nx3 cube-frame, img_pts Nx2 pixels, n_faces) or None.
+        Used by the multi-view solver, which needs the raw correspondences."""
+        gray = _as_gray(frame)
+        corners, ids, _ = self._detector.detectMarkers(gray)
+        if ids is None:
+            return None
+        obj_list, img_list, n = [], [], 0
+        for i, mid in enumerate(ids.flatten()):
+            mid = int(mid)
+            if mid not in markers.CUBE_FACE_OBJ_PTS:
+                continue
+            obj_list.append(markers.CUBE_FACE_OBJ_PTS[mid])
+            img_list.append(corners[i][0].astype(np.float64))
+            n += 1
+        if n == 0:
+            return None
+        return np.vstack(obj_list).astype(np.float64), np.vstack(img_list).astype(np.float64), n
+
     def estimate(self, frame: np.ndarray, mtx: np.ndarray, dist: np.ndarray) -> Optional[ProbeObservation]:
         gray = _as_gray(frame)
         corners, ids, _ = self._detector.detectMarkers(gray)
@@ -157,6 +176,138 @@ def angle_between_deg(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.degrees(np.arccos(c)))
 
 
+# ── Multi-view (joint) probe solve ───────────────────────────────────────────
+# Instead of solving the cube pose independently per camera and averaging (which
+# fails when one camera lands on the wrong pose-ambiguity branch and the 100 mm
+# rod swings the tip far away), we solve a SINGLE cube->model pose that must
+# explain the marker corners in BOTH cameras at once.  Two views ~45 deg apart
+# over-constrain the 6-DOF pose and remove the ambiguity.
+
+@dataclass
+class CameraView:
+    """One camera's contribution to the joint solve."""
+    R_mc: np.ndarray   # model->camera rotation (3x3)
+    t_mc: np.ndarray   # model->camera translation (3,)
+    K:    np.ndarray
+    dist: np.ndarray
+    obj:  np.ndarray   # cube-frame 3-D marker corners (N x 3)
+    img:  np.ndarray   # image points (N x 2)
+    n_faces: int
+
+
+@dataclass
+class MultiViewProbe:
+    tip_model:   np.ndarray
+    base_model:  np.ndarray
+    direction:   np.ndarray
+    cube_R_model: np.ndarray
+    cube_t_model: np.ndarray
+    n_cameras:   int
+    n_faces:     int
+    reproj_px:   float
+    per_cam_reproj: List[float]
+
+
+def _lm_refine(p0, resfn, iters=40, lam=1e-3):
+    p = np.asarray(p0, float).copy()
+    r = resfn(p); cost = float(r @ r)
+    for _ in range(iters):
+        J = np.zeros((len(r), len(p)))
+        for k in range(len(p)):
+            h = 1e-6 * max(1.0, abs(p[k])); dp = np.zeros(len(p)); dp[k] = h
+            J[:, k] = (resfn(p + dp) - r) / h
+        H = J.T @ J; g = J.T @ r
+        improved = False
+        for _t in range(12):
+            try:
+                step = np.linalg.solve(H + lam * np.diag(np.diag(H) + 1e-12), -g)
+            except np.linalg.LinAlgError:
+                lam *= 10; continue
+            pn = p + step; rn = resfn(pn); cn = float(rn @ rn)
+            if cn < cost:
+                p, r, cost = pn, rn, cn; lam = max(lam * 0.5, 1e-8); improved = True; break
+            lam *= 2.5
+        if not improved:
+            break
+    return p, cost
+
+
+def _cube_to_model_initial(view: CameraView):
+    """Single-camera estimate of cube->model, used as an optimisation seed."""
+    ok, rc, tc = cv2.solvePnP(view.obj, view.img, view.K, view.dist,
+                              flags=cv2.SOLVEPNP_SQPNP)
+    if not ok:
+        return None
+    Rci, _ = cv2.Rodrigues(rc)
+    R_m = view.R_mc.T @ Rci
+    t_m = view.R_mc.T @ (tc.flatten() - view.t_mc)
+    rvec, _ = cv2.Rodrigues(R_m)
+    return np.concatenate([rvec.flatten(), t_m])
+
+
+def solve_probe_multiview(views: List[CameraView]) -> Optional[MultiViewProbe]:
+    """Solve one cube->model pose consistent with all camera views."""
+    if not views:
+        return None
+
+    def resfn(p):
+        Rmm, _ = cv2.Rodrigues(p[:3]); tmm = p[3:6]
+        res = []
+        for v in views:
+            R_cc = v.R_mc @ Rmm
+            t_cc = v.R_mc @ tmm + v.t_mc
+            rv, _ = cv2.Rodrigues(R_cc)
+            proj, _ = cv2.projectPoints(v.obj, rv, t_cc, v.K, v.dist)
+            res.append((proj.reshape(-1, 2) - v.img).ravel())
+        return np.concatenate(res)
+
+    # Try a seed from each camera; keep the lowest-cost joint refinement so a
+    # wrong-branch seed in one camera can't trap the result.
+    best_p, best_cost = None, np.inf
+    for v in views:
+        seed = _cube_to_model_initial(v)
+        if seed is None:
+            continue
+        p, cost = _lm_refine(seed, resfn)
+        if cost < best_cost:
+            best_p, best_cost = p, cost
+    if best_p is None:
+        return None
+
+    Rmm, _ = cv2.Rodrigues(best_p[:3]); tmm = best_p[3:6]
+    # per-camera reprojection (RMS px) under the joint pose, plus the overall.
+    per_cam, all_sq, n_all = [], 0.0, 0
+    for v in views:
+        R_cc = v.R_mc @ Rmm
+        t_cc = v.R_mc @ tmm + v.t_mc
+        rv, _ = cv2.Rodrigues(R_cc)
+        proj, _ = cv2.projectPoints(v.obj, rv, t_cc, v.K, v.dist)
+        d2 = np.sum((proj.reshape(-1, 2) - v.img) ** 2, axis=1)
+        per_cam.append(float(np.sqrt(np.mean(d2))))
+        all_sq += float(np.sum(d2)); n_all += len(d2)
+    reproj = float(np.sqrt(all_sq / max(n_all, 1)))     # RMS pixel error per point
+    tip  = Rmm @ markers.ROD_TIP_IN_CUBE  + tmm
+    base = Rmm @ markers.ROD_BASE_IN_CUBE + tmm
+    d = tip - base; n = np.linalg.norm(d)
+    direction = d / n if n > 1e-9 else np.array([0.0, 0.0, 1.0])
+    return MultiViewProbe(tip, base, direction, Rmm, tmm,
+                          len(views), sum(v.n_faces for v in views), reproj, per_cam)
+
+
+def single_view_reproj(view: CameraView) -> Optional[float]:
+    """How well one camera's own faces fit a single cube pose (RMS px).
+    High for a camera that sees >=2 faces => the cube geometry it sees is
+    inconsistent (a sticker is glued wrong); low here but high joint => the two
+    cameras' calibrations disagree."""
+    ok, rv, tv = cv2.solvePnP(view.obj, view.img, view.K, view.dist,
+                              flags=cv2.SOLVEPNP_SQPNP)
+    if not ok:
+        return None
+    proj, _ = cv2.projectPoints(view.obj, rv, tv, view.K, view.dist)
+    d2 = np.sum((proj.reshape(-1, 2) - view.img) ** 2, axis=1)
+    return float(np.sqrt(np.mean(d2)))
+
+
 def _as_gray(frame: np.ndarray) -> np.ndarray:
     if frame.ndim == 2:
         return frame
@@ -187,5 +338,26 @@ def draw_probe_pose(frame, obs: ProbeObservation, mtx, dist, axis_len=18.0):
             b = tuple(np.round(p[1]).astype(int))
             cv2.line(frame, a, b, (0, 0, 255), 2, cv2.LINE_AA)
             cv2.circle(frame, b, 6, (0, 0, 255), -1, cv2.LINE_AA)
+    except cv2.error:
+        pass
+
+
+def draw_probe_in_view(frame, mv: "MultiViewProbe", board: BoardPose, mtx, dist):
+    """Draw the JOINT-solved rod (model frame) projected into one camera, using
+    that camera's board pose to compose cube->model->camera."""
+    try:
+        R_cc = cv2.Rodrigues(board.rvec)[0] @ mv.cube_R_model
+        t_cc = cv2.Rodrigues(board.rvec)[0] @ mv.cube_t_model + board.tvec.flatten()
+        rv, _ = cv2.Rodrigues(R_cc)
+        pts = np.vstack([markers.ROD_BASE_IN_CUBE, markers.ROD_TIP_IN_CUBE]).astype(np.float64)
+        proj, _ = cv2.projectPoints(pts, rv, t_cc, mtx, dist)
+        p = proj.reshape(-1, 2)
+        if np.all(np.isfinite(p)):
+            a = tuple(np.round(p[0]).astype(int))
+            b = tuple(np.round(p[1]).astype(int))
+            cv2.line(frame, a, b, (0, 0, 0), 5, cv2.LINE_AA)
+            cv2.line(frame, a, b, (0, 0, 255), 3, cv2.LINE_AA)
+            cv2.circle(frame, b, 6, (0, 0, 255), -1, cv2.LINE_AA)
+            cv2.circle(frame, b, 6, (255, 255, 255), 1, cv2.LINE_AA)
     except cv2.error:
         pass

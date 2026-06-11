@@ -65,6 +65,15 @@ CAMERA_AGREEMENT_TOL_MM  = 5.0   # max acceptable disagreement between the two c
 TRAJECTORY_ANGLE_TOL_DEG = 5.0
 DLT_REPROJ_WARN_PX       = 2.0   # warn if X-ray fiducial reprojection exceeds this
 
+# ── Simulation overlay appearance ────────────────────────────────────────────
+OVERLAY_THICKNESS_PX = 5         # trajectory line thickness on the X-ray
+OVERLAY_TIP_RADIUS_PX = 7        # tip marker radius
+
+# ── Live smoothing / outlier rejection (reduces probe flicker) ────────────────
+SMOOTH_ALPHA        = 0.6        # 0 = no smoothing, ->1 = heavier smoothing
+SMOOTH_TRUST_PX     = 3.0        # a solve this accurate is always accepted
+SMOOTH_MAX_JUMP_MM  = 40.0       # if a high-error solve jumps more than this, reject it
+
 # ── Intrinsic calibration ───────────────────────────────────────────────────
 MIN_CALIB_VIEWS = 8       # minimum board captures for a usable lens calibration
 GOOD_CALIB_RMS  = 1.0     # px; calibration RMS below this is "good"

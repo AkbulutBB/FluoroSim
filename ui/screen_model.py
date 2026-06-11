@@ -204,8 +204,7 @@ class ModelScreen(Screen):
             flag = "" if err <= config.DLT_REPROJ_WARN_PX else "  (high - check clicks/coords)"
             msgs.append(f"{r.upper()} reprojection: {err:.2f} px{flag}")
 
-        # carry the verification hole from settings if present
-        path = reg.save()
+        reg.save()
         self.session.model = reg
         self.status.configure(text="Saved to data/models.\n" + "\n".join(msgs))
 

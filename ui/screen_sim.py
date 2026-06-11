@@ -26,8 +26,8 @@ import numpy as np
 import config
 from core import markers
 from core.camera_io import CameraStream
-from core.tracking import (BoardTracker, ProbeTracker, fuse_model_points,
-                           draw_board_pose, draw_probe_pose)
+from core.tracking import (BoardTracker, ProbeTracker, CameraView,
+                           solve_probe_multiview, draw_board_pose, draw_probe_in_view)
 from ui.app import Screen
 from ui import widgets as W
 
@@ -44,6 +44,8 @@ class SimulationScreen(Screen):
         self._board_aruco = cv2.aruco.ArucoDetector(markers.CHARUCO_DICTIONARY)
         self._probe_aruco = markers.make_aruco_detector()
         self._xray = {r: None for r in config.CAMERA_ROLES}
+        self._sm_tip = None     # smoothed model-space tip/base (reduces flicker)
+        self._sm_base = None
 
         self._build_header()
 
@@ -107,90 +109,133 @@ class SimulationScreen(Screen):
 
     def _draw_overlay(self, xray_bgr, P, base_model, tip_model):
         img = xray_bgr.copy()
-        pb = self._safe_project(P, base_model, img.shape)
-        pt = self._safe_project(P, tip_model, img.shape)
+        pb = self._safe_project(P, base_model, img.shape)   # cube/back end
+        pt = self._safe_project(P, tip_model, img.shape)    # pointy/working end
         if pb is None or pt is None:
             return img, False
-        cv2.line(img, pb, pt, (60, 220, 60), 3, cv2.LINE_AA)
-        cv2.circle(img, pb, 7, (40, 200, 255), 2, cv2.LINE_AA)
-        cv2.circle(img, pt, 8, (60, 60, 240), -1, cv2.LINE_AA)
-        cv2.circle(img, pt, 8, (255, 255, 255), 1, cv2.LINE_AA)
+        th = config.OVERLAY_THICKNESS_PX
+        tr = config.OVERLAY_TIP_RADIUS_PX
+        pb = np.array(pb, float); pt = np.array(pt, float)
+        # shaft with dark outline for contrast on the grey X-ray
+        cv2.line(img, tuple(pb.astype(int)), tuple(pt.astype(int)), (0, 0, 0), th + 4, cv2.LINE_AA)
+        cv2.line(img, tuple(pb.astype(int)), tuple(pt.astype(int)), (60, 220, 60), th, cv2.LINE_AA)
+        # CUBE end: open square (the handle/back of the probe)
+        s = tr + 1
+        cv2.rectangle(img, (int(pb[0]-s), int(pb[1]-s)), (int(pb[0]+s), int(pb[1]+s)), (0, 0, 0), 3)
+        cv2.rectangle(img, (int(pb[0]-s), int(pb[1]-s)), (int(pb[0]+s), int(pb[1]+s)), (60, 220, 60), 1)
+        # TIP end: a clean filled arrowhead pointing the way the probe travels
+        d = pt - pb; n = np.linalg.norm(d)
+        if n > 1e-3:
+            u = d / n
+            perp = np.array([-u[1], u[0]])
+            L = tr * 2.6           # arrowhead length
+            wdt = tr * 1.5         # half-width
+            apex  = pt + u * tr
+            left  = pt - u * (L - tr) + perp * wdt
+            right = pt - u * (L - tr) - perp * wdt
+            tri = np.array([apex, left, right], np.int32)
+            cv2.fillConvexPoly(img, tri, (60, 60, 240), cv2.LINE_AA)   # red tip
+            cv2.polylines(img, [tri], True, (0, 0, 0), 1, cv2.LINE_AA)  # outline
         return img, True
 
     # ── tick ─────────────────────────────────────────────────────────────────
     def _tick(self):
         model = self.session.model
-        tips, bases = [], []
+        views, boards = [], {}
         board_seen = {r: False for r in config.CAMERA_ROLES}
-        probe_used = {r: 0 for r in config.CAMERA_ROLES}
+        probe_faces = {r: 0 for r in config.CAMERA_ROLES}
         probe_markers = {r: 0 for r in config.CAMERA_ROLES}
+        frames = {}
 
         for r in config.CAMERA_ROLES:
             stream = self.streams.get(r)
             intr = self.session.intrinsics.get(r)
             frame = stream.read() if stream else None
+            frames[r] = (frame, intr)
+            if frame is None or intr is None:
+                continue
+            board = self._board_tracker.estimate(frame, intr.mtx, intr.dist)
+            det = self._probe_tracker.detect(frame)
+            boards[r] = board
+            board_seen[r] = board is not None
+            if det is not None:
+                probe_faces[r] = det[2]
+            if board is not None and det is not None:
+                R_mc = cv2.Rodrigues(board.rvec)[0]
+                views.append(CameraView(R_mc, board.tvec.flatten(), intr.mtx, intr.dist,
+                                        det[0], det[1], det[2]))
+
+        mv = solve_probe_multiview(views) if views else None
+
+        # temporal smoothing + outlier rejection to calm the flicker
+        if mv is not None:
+            if self._sm_tip is None:
+                self._sm_tip, self._sm_base = mv.tip_model.copy(), mv.base_model.copy()
+            else:
+                jump = float(np.linalg.norm(mv.tip_model - self._sm_tip))
+                if mv.reproj_px <= config.SMOOTH_TRUST_PX or jump <= config.SMOOTH_MAX_JUMP_MM:
+                    a = config.SMOOTH_ALPHA
+                    self._sm_tip  = a * self._sm_tip  + (1 - a) * mv.tip_model
+                    self._sm_base = a * self._sm_base + (1 - a) * mv.base_model
+                # else: treat as an outlier (likely a pose flip) and hold steady
+
+        # draw feeds with overlays
+        for r in config.CAMERA_ROLES:
+            frame, intr = frames[r]
             if frame is None or intr is None:
                 self.feed[r].show(frame, "no signal / not calibrated")
                 continue
-            board = self._board_tracker.estimate(frame, intr.mtx, intr.dist)
-            probe = self._probe_tracker.estimate(frame, intr.mtx, intr.dist)
-            board_seen[r] = board is not None
-            if board is not None and probe is not None:
-                probe_used[r] = probe.n_faces
-                tips.append(board.transform.apply(probe.rod_tip_cam))
-                bases.append(board.transform.apply(probe.rod_base_cam))
             _, probe_markers[r] = self._annotate(frame)
-            if board is not None:
-                draw_board_pose(frame, board, intr.mtx, intr.dist)
-            if board is not None and probe is not None:
-                draw_probe_pose(frame, probe, intr.mtx, intr.dist)
+            if boards.get(r) is not None:
+                draw_board_pose(frame, boards[r], intr.mtx, intr.dist)
+                if mv is not None:
+                    draw_probe_in_view(frame, mv, boards[r], intr.mtx, intr.dist)
             self.feed[r].show(frame)
 
-        fused = fuse_model_points(tips, bases) if tips else None
         off_image = False
-
         for r in config.CAMERA_ROLES:
             base_img = self._xray.get(r)
             P = model.view(r).P if model else None
             if base_img is None or P is None:
                 self.xray_panel[r].show(None, "no X-ray / not registered")
                 continue
-            if fused is not None:
-                shown, ok = self._draw_overlay(base_img, P, fused.base_model, fused.tip_model)
+            if self._sm_tip is not None:
+                shown, ok = self._draw_overlay(base_img, P, self._sm_base, self._sm_tip)
                 off_image = off_image or (not ok)
             else:
                 shown = base_img
             self.xray_panel[r].show(shown)
 
-        self._update_status(board_seen, probe_used, probe_markers, fused, off_image)
+        self._update_status(board_seen, probe_faces, probe_markers, mv, off_image)
         self._tick_id = self.after(50, self._tick)
 
-    def _update_status(self, board_seen, probe_used, probe_markers, fused, off_image):
+    def _update_status(self, board_seen, probe_faces, probe_markers, mv, off_image):
         lines = []
         for r in config.CAMERA_ROLES:
             b = "board OK" if board_seen[r] else "no board"
-            if probe_used[r]:
-                f = f"probe {probe_used[r]}f"
+            if probe_faces[r]:
+                f = f"cube {probe_faces[r]}f"
             elif probe_markers[r]:
-                f = f"cube seen ({probe_markers[r]} mk) but not solved"
+                f = f"cube seen ({probe_markers[r]} mk)"
             else:
                 f = "no cube"
             lines.append(f"{config.ROLE_LABEL[r]}: {b}, {f}")
-        if fused is not None:
-            t = fused.tip_model
-            lines.append(f"tip(model): [{t[0]:.0f}, {t[1]:.0f}, {t[2]:.0f}] mm ({fused.n_cameras} cam)")
-            if fused.agreement_mm is not None:
-                tag = "" if fused.agreement_mm <= config.CAMERA_AGREEMENT_TOL_MM else "  \u26a0 high"
-                lines.append(f"agreement: {fused.agreement_mm:.1f} mm{tag}")
+        if mv is not None:
+            t = mv.tip_model
+            lines.append(f"tip(model): [{t[0]:.0f}, {t[1]:.0f}, {t[2]:.0f}] mm "
+                         f"({mv.n_cameras} cam, {mv.n_faces}f)")
+            tag = "" if mv.reproj_px <= 3.0 else "  \u26a0 high"
+            lines.append(f"solve reprojection: {mv.reproj_px:.1f} px{tag}")
             if off_image:
-                lines.append("\u26a0 tip projects off-image - check fiducial coordinates")
+                lines.append("\u26a0 tip projects off-image - check fiducial frame")
         else:
-            lines.append("probe not solved in any view (need board + cube together)")
+            lines.append("probe not solved (need board + cube in a view)")
         self.status.configure(text="\n".join(lines))
 
     # ── lifecycle ──────────────────────────────────────────────────────────────
     def on_show(self):
         model = self.session.model
+        self._sm_tip = self._sm_base = None
         for r in config.CAMERA_ROLES:
             self._xray[r] = cv2.imread(model.view(r).image_path) \
                 if (model and model.view(r).image_path) else None
