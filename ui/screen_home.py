@@ -8,7 +8,6 @@ lenses are calibrated and a model registration is loaded and complete.
 """
 
 from __future__ import annotations
-import tkinter as tk
 from tkinter import ttk
 
 import config

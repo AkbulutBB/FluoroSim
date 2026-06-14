@@ -27,7 +27,7 @@ import cv2
 import config
 from core import paths
 from core.camera_io import CameraStream, list_available_cameras
-from core.intrinsics import CharucoCalibrator, CameraIntrinsics
+from core.intrinsics import CharucoCalibrator
 from core.tracking import (BoardTracker, ProbeTracker, CameraView,
                            solve_probe_multiview, single_view_reproj,
                            draw_board_pose, draw_probe_in_view)

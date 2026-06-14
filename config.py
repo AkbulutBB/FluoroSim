@@ -69,10 +69,10 @@ DLT_REPROJ_WARN_PX       = 2.0   # warn if X-ray fiducial reprojection exceeds t
 OVERLAY_THICKNESS_PX = 5         # trajectory line thickness on the X-ray
 OVERLAY_TIP_RADIUS_PX = 7        # tip marker radius
 
-# ── Live smoothing / outlier rejection (reduces probe flicker) ────────────────
-SMOOTH_ALPHA        = 0.6        # 0 = no smoothing, ->1 = heavier smoothing
-SMOOTH_TRUST_PX     = 3.0        # a solve this accurate is always accepted
-SMOOTH_MAX_JUMP_MM  = 40.0       # if a high-error solve jumps more than this, reject it
+# ── Aligning CAD fiducials to the tracker frame (probe best-fit) ──────────────
+DIGITIZE_REJECT_PX   = 25.0      # ignore clearly-bad frames above this
+DIGITIZE_STABLE_MM   = 5.0       # spread below this = a clean, steady reading
+DIGITIZE_MIN_SAMPLES = 12        # frames to average before a capture is allowed
 
 # ── Intrinsic calibration ───────────────────────────────────────────────────
 MIN_CALIB_VIEWS = 8       # minimum board captures for a usable lens calibration
@@ -85,5 +85,5 @@ GOOD_CALIB_RMS  = 1.0     # px; calibration RMS below this is "good"
 # projected through ITS OWN matrix -- so the X-rays can be a TRUE AP and a TRUE
 # lateral no matter where the webcams sit.
 CAMERA_ROLES = ("ap", "lat")
-ROLE_LABEL   = {"ap": "Camera 1 (head-on)", "lat": "Camera 2 (45 deg oblique)"}
+ROLE_LABEL   = {"ap": "Camera 1", "lat": "Camera 2 (oblique \u2248 60\u00b0)"}
 XRAY_LABEL   = {"ap": "AP", "lat": "Lateral"}

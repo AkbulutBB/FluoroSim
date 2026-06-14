@@ -17,8 +17,9 @@ If the red rod doesn't sit on the physical K-wire, the probe pose is wrong.
 """
 
 from __future__ import annotations
-import tkinter as tk
 from tkinter import ttk
+from collections import deque
+import time
 
 import cv2
 import numpy as np
@@ -44,8 +45,12 @@ class SimulationScreen(Screen):
         self._board_aruco = cv2.aruco.ArucoDetector(markers.CHARUCO_DICTIONARY)
         self._probe_aruco = markers.make_aruco_detector()
         self._xray = {r: None for r in config.CAMERA_ROLES}
-        self._sm_tip = None     # smoothed model-space tip/base (reduces flicker)
-        self._sm_base = None
+        # short history of recent 2-camera fixes; the overlay uses the median
+        # (rejects single pose-flips, but follows real motion within a few frames)
+        self._tip_hist = deque(maxlen=5)
+        self._base_hist = deque(maxlen=5)
+        self._last_fix_t = 0.0          # wall-clock of last accepted 2-cam fix
+        self._last_reproj = None
 
         self._build_header()
 
@@ -81,6 +86,15 @@ class SimulationScreen(Screen):
         bar.pack(fill="x", padx=16, pady=12)
         ttk.Button(bar, text="\u2190 Home", command=lambda: self.app.show("home")).pack(side="left")
         ttk.Label(bar, text="Simulation", style="H2.TLabel").pack(side="left", padx=14)
+        # prominent live tracking indicator (right side of the header)
+        self.live_lbl = ttk.Label(bar, text="\u25cb  starting\u2026", style="H2.TLabel")
+        self.live_lbl.pack(side="right")
+
+    def _set_live(self, text, color):
+        try:
+            self.live_lbl.configure(text=text, foreground=color)
+        except Exception:
+            pass
 
     # ── feed annotation ───────────────────────────────────────────────────────
     def _annotate(self, frame):
@@ -107,7 +121,7 @@ class SimulationScreen(Screen):
             return None
         return tuple(p.astype(int))
 
-    def _draw_overlay(self, xray_bgr, P, base_model, tip_model):
+    def _draw_overlay(self, xray_bgr, P, base_model, tip_model, color=(60, 220, 60)):
         img = xray_bgr.copy()
         pb = self._safe_project(P, base_model, img.shape)   # cube/back end
         pt = self._safe_project(P, tip_model, img.shape)    # pointy/working end
@@ -118,11 +132,11 @@ class SimulationScreen(Screen):
         pb = np.array(pb, float); pt = np.array(pt, float)
         # shaft with dark outline for contrast on the grey X-ray
         cv2.line(img, tuple(pb.astype(int)), tuple(pt.astype(int)), (0, 0, 0), th + 4, cv2.LINE_AA)
-        cv2.line(img, tuple(pb.astype(int)), tuple(pt.astype(int)), (60, 220, 60), th, cv2.LINE_AA)
+        cv2.line(img, tuple(pb.astype(int)), tuple(pt.astype(int)), color, th, cv2.LINE_AA)
         # CUBE end: open square (the handle/back of the probe)
         s = tr + 1
         cv2.rectangle(img, (int(pb[0]-s), int(pb[1]-s)), (int(pb[0]+s), int(pb[1]+s)), (0, 0, 0), 3)
-        cv2.rectangle(img, (int(pb[0]-s), int(pb[1]-s)), (int(pb[0]+s), int(pb[1]+s)), (60, 220, 60), 1)
+        cv2.rectangle(img, (int(pb[0]-s), int(pb[1]-s)), (int(pb[0]+s), int(pb[1]+s)), color, 1)
         # TIP end: a clean filled arrowhead pointing the way the probe travels
         d = pt - pb; n = np.linalg.norm(d)
         if n > 1e-3:
@@ -167,17 +181,26 @@ class SimulationScreen(Screen):
 
         mv = solve_probe_multiview(views) if views else None
 
-        # temporal smoothing + outlier rejection to calm the flicker
-        if mv is not None:
-            if self._sm_tip is None:
-                self._sm_tip, self._sm_base = mv.tip_model.copy(), mv.base_model.copy()
-            else:
-                jump = float(np.linalg.norm(mv.tip_model - self._sm_tip))
-                if mv.reproj_px <= config.SMOOTH_TRUST_PX or jump <= config.SMOOTH_MAX_JUMP_MM:
-                    a = config.SMOOTH_ALPHA
-                    self._sm_tip  = a * self._sm_tip  + (1 - a) * mv.tip_model
-                    self._sm_base = a * self._sm_base + (1 - a) * mv.base_model
-                # else: treat as an outlier (likely a pose flip) and hold steady
+        # A two-camera fix where BOTH cameras see >=2 faces is trustworthy; a
+        # 1-face camera carries a pose ambiguity that the long probe amplifies.
+        good_faces = sum(1 for r in config.CAMERA_ROLES if probe_faces[r] >= 2)
+        mv_reliable = mv if (mv is not None and mv.n_cameras == 2) else None
+        if mv_reliable is not None:
+            self._tip_hist.append(mv_reliable.tip_model.copy())
+            self._base_hist.append(mv_reliable.base_model.copy())
+            self._last_fix_t = time.monotonic()
+            self._last_reproj = mv_reliable.reproj_px
+
+        # overlay position = per-axis median of recent fixes (robust + responsive)
+        if self._tip_hist:
+            tip_ov = np.median(np.array(self._tip_hist), axis=0)
+            base_ov = np.median(np.array(self._base_hist), axis=0)
+        else:
+            tip_ov = base_ov = None
+
+        age = time.monotonic() - self._last_fix_t
+        fresh = (tip_ov is not None) and (age < 0.4)
+        overlay_color = (60, 220, 60) if fresh else (40, 170, 230)  # green vs amber
 
         # draw feeds with overlays
         for r in config.CAMERA_ROLES:
@@ -199,12 +222,22 @@ class SimulationScreen(Screen):
             if base_img is None or P is None:
                 self.xray_panel[r].show(None, "no X-ray / not registered")
                 continue
-            if self._sm_tip is not None:
-                shown, ok = self._draw_overlay(base_img, P, self._sm_base, self._sm_tip)
+            if tip_ov is not None:
+                shown, ok = self._draw_overlay(base_img, P, base_ov, tip_ov, overlay_color)
                 off_image = off_image or (not ok)
             else:
                 shown = base_img
             self.xray_panel[r].show(shown)
+
+        # prominent live indicator
+        if tip_ov is None:
+            self._set_live("\u25cb  no probe fix \u2014 need both cameras on the cube", "#9aa4ad")
+        elif fresh:
+            rp = f"{self._last_reproj:.0f}px" if self._last_reproj is not None else ""
+            extra = "" if good_faces == 2 else "  (1 face on a camera \u2013 move cube)"
+            self._set_live(f"\u25cf  live \u2014 2 cam {rp}{extra}", "#46c46a")
+        else:
+            self._set_live("\u25d0  holding last fix \u2014 get both cameras on the cube", "#e0a83c")
 
         self._update_status(board_seen, probe_faces, probe_markers, mv, off_image)
         self._tick_id = self.after(50, self._tick)
@@ -224,18 +257,23 @@ class SimulationScreen(Screen):
             t = mv.tip_model
             lines.append(f"tip(model): [{t[0]:.0f}, {t[1]:.0f}, {t[2]:.0f}] mm "
                          f"({mv.n_cameras} cam, {mv.n_faces}f)")
-            tag = "" if mv.reproj_px <= 3.0 else "  \u26a0 high"
-            lines.append(f"solve reprojection: {mv.reproj_px:.1f} px{tag}")
-            if off_image:
-                lines.append("\u26a0 tip projects off-image - check fiducial frame")
+            if mv.n_cameras < 2:
+                lines.append("\u26a0 only 1 camera sees the cube - overlay holds last "
+                             "2-camera fix.\n   get BOTH cameras on the cube.")
+            else:
+                tag = "" if mv.reproj_px <= 3.0 else "  \u26a0 high"
+                lines.append(f"solve reprojection: {mv.reproj_px:.1f} px{tag}")
+                if off_image:
+                    lines.append("\u26a0 tip projects off-image - check fiducial frame")
         else:
-            lines.append("probe not solved (need board + cube in a view)")
+            lines.append("probe not solved (need board + cube in BOTH views)")
         self.status.configure(text="\n".join(lines))
 
     # ── lifecycle ──────────────────────────────────────────────────────────────
     def on_show(self):
         model = self.session.model
-        self._sm_tip = self._sm_base = None
+        self._tip_hist.clear(); self._base_hist.clear()
+        self._last_fix_t = 0.0; self._last_reproj = None
         for r in config.CAMERA_ROLES:
             self._xray[r] = cv2.imread(model.view(r).image_path) \
                 if (model and model.view(r).image_path) else None
