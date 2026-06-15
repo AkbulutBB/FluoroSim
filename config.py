@@ -4,8 +4,8 @@ config.py  —  FluoroSim physical constants and tolerances
 
 Every hard number that describes the *physical* hardware lives here, so the
 rest of the code never hard-codes a millimetre value.  These match the printed
-ChArUco board and the ArUco probe cube you are already using — do not change
-them unless you reprint the markers.
+ChArUco board and the ArUco probe on the platform — do not change them unless
+you reprint the markers or re-machine the probe.
 
 Coordinate convention (MODEL space, a.k.a. board space)
 -------------------------------------------------------
@@ -39,18 +39,59 @@ CHARUCO_MARKER_MM = 14.4     # ArUco marker edge inside each square (0.80 x squa
 # Minimum interpolated ChArUco corners before we trust a board pose.
 MIN_CHARUCO_CORNERS = 6
 
-# ── ArUco probe cube ────────────────────────────────────────────────────────
+# ── ArUco probe: TWO stacked cubes ──────────────────────────────────────────
+# The probe is now a rigid body of two ArUco cubes stacked along one axis, with
+# the K-wire exiting the BOTTOM cube's centre (collinear with the axis — no more
+# lateral offset).  Only the 4 SIDE faces of each cube carry markers (the top
+# and bottom faces are taken up by the handle and the inter-cube spacer), so
+# there are 4 markers per cube, 8 in total.
+#
+# Why two cubes:  the tracker solves ONE rigid pose from every marker corner it
+# can see in both cameras.  Spreading 8 markers over a ~53 mm baseline gives the
+# pose a much longer angular lever than a single 40 mm cube, so the extrapolated
+# tip is more stable.  "Drawing a line between the two cubes" is exactly the
+# probe-local +Y axis below — it falls straight out of the rigid solve.
 PROBE_DICT      = cv2.aruco.DICT_4X4_50
-PROBE_IDS       = (0, 1, 2, 3, 4, 5)   # one marker per cube face
-CUBE_SIDE_MM    = 40.0                 # outer edge of the white PETG cube
-PROBE_MARKER_MM = 32.0                 # printed marker edge on each face
+CUBE_SIDE_MM    = 40.0          # outer edge of EACH white PETG cube     <-- CONFIRM
+PROBE_MARKER_MM = 32.0          # printed marker edge on each side face   <-- CONFIRM
 
-# Rod / K-wire geometry, expressed in CUBE-LOCAL coordinates.
-# Cube centre is the origin; +Z exits the FRONT face (marker ID 0).
-ROD_EXIT_FACE_ID = 0
-ROD_BASE_IN_CUBE = np.array([0.0, 0.0,  CUBE_SIDE_MM / 2.0],          dtype=np.float64)  # (0,0, 20)
-ROD_LENGTH_MM    = 100.0
-ROD_TIP_IN_CUBE  = np.array([0.0, 0.0,  CUBE_SIDE_MM / 2.0 + ROD_LENGTH_MM], dtype=np.float64)  # (0,0,120)
+# Clear gap between the two cubes' facing surfaces (the 5 mm connecting spacer).
+CUBE_GAP_MM     = 5.0
+CUBE_PITCH_MM   = CUBE_SIDE_MM + CUBE_GAP_MM        # centre-to-centre = 45 mm (CAD-verified)
+
+# Probe-local frame:
+#   origin : BOTTOM cube centre
+#   +Y     : toward the TOP cube (handle side)
+#   -Y     : toward the K-wire tip
+#   +/-X, +/-Z : the four side-face normals
+PROBE_BOTTOM_CENTER = np.array([0.0, 0.0,            0.0], dtype=np.float64)
+PROBE_TOP_CENTER    = np.array([0.0, CUBE_PITCH_MM,  0.0], dtype=np.float64)
+
+# Marker-ID -> (which cube, which side face).  ***SINGLE SOURCE OF TRUTH***.
+# This table must match how you actually print and glue the stickers; the same
+# table will drive the marker-sheet generator so the two can't drift apart.
+# Faces: "PZ" (+Z front), "NZ" (-Z back), "PX" (+X right), "NX" (-X left).
+PROBE_FACE_IDS = {
+    # Bottom cube  ("Aruco 2" in your render — the one the K-wire exits)
+    0: ("bottom", "PZ"),
+    1: ("bottom", "NZ"),
+    2: ("bottom", "PX"),
+    3: ("bottom", "NX"),
+    # Top cube  ("Aruco 1" — handle side)
+    4: ("top", "PZ"),
+    5: ("top", "NZ"),
+    6: ("top", "PX"),
+    7: ("top", "NX"),
+}
+PROBE_IDS = tuple(sorted(PROBE_FACE_IDS))
+
+# ── K-wire geometry, in the probe-local frame above ──────────────────────────
+# The wire is collinear with the probe axis and exits the bottom cube centre.
+# CAD-verified: the tip stands 100 mm from the BOTTOM-CUBE CENTRE along -Y.
+ROD_TIP_OFFSET_MM = 100.0
+ROD_LENGTH_MM     = ROD_TIP_OFFSET_MM
+ROD_BASE_IN_CUBE  = PROBE_BOTTOM_CENTER.copy()                                   # (0, 0, 0)
+ROD_TIP_IN_CUBE   = PROBE_BOTTOM_CENTER + np.array([0.0, -ROD_TIP_OFFSET_MM, 0.0])  # (0, -100, 0)
 
 # ── Calibration / verification hole ─────────────────────────────────────────
 # A drilled hole on the platform at a *known* model-space coordinate.  Insert
@@ -85,5 +126,5 @@ GOOD_CALIB_RMS  = 1.0     # px; calibration RMS below this is "good"
 # projected through ITS OWN matrix -- so the X-rays can be a TRUE AP and a TRUE
 # lateral no matter where the webcams sit.
 CAMERA_ROLES = ("ap", "lat")
-ROLE_LABEL   = {"ap": "Camera 1", "lat": "Camera 2 (oblique \u2248 60\u00b0)"}
+ROLE_LABEL   = {"ap": "Camera 1", "lat": "Camera 2 (oblique \u2248 45\u00b0)"}
 XRAY_LABEL   = {"ap": "AP", "lat": "Lateral"}
