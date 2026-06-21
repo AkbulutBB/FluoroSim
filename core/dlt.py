@@ -80,6 +80,39 @@ class ProjectionMatrix:
         P /= nrm                         # consistent scale for a finite camera
         return cls(P)
 
+    @classmethod
+    def from_correspondences_robust(cls, obj_pts: np.ndarray, img_pts: np.ndarray,
+                                    thresh_px: float = 4.0, min_keep: int = 6):
+        """DLT with greedy outlier rejection.
+
+        A single bearing with a wrong 3-D coordinate (or a stray click) doesn't
+        just add noise — it tilts the whole projection, which corrupts the
+        trajectory ANGLE even while the fiducial *mean* error still looks
+        moderate.  We iteratively drop the worst-reprojecting fiducial while it
+        exceeds ``thresh_px`` and while more than ``min_keep`` remain, then refit
+        on the survivors.
+
+        Returns ``(ProjectionMatrix, inlier_mask, residuals_px)`` where the mask
+        and residuals are over ALL input fiducials under the final fit, so the
+        caller can show which bearings to re-measure.
+        """
+        obj = np.asarray(obj_pts, dtype=np.float64)
+        img = np.asarray(img_pts, dtype=np.float64)
+        n = len(obj)
+        keep = list(range(n))
+        while len(keep) > max(min_keep, 6):
+            P = cls.from_correspondences(obj[keep], img[keep])
+            res = np.linalg.norm(P.project(obj[keep]) - img[keep], axis=1)
+            w = int(np.argmax(res))
+            if res[w] <= thresh_px:
+                break
+            keep.pop(w)
+        P = cls.from_correspondences(obj[keep], img[keep])
+        residuals = np.linalg.norm(P.project(obj) - img, axis=1)
+        mask = np.zeros(n, dtype=bool)
+        mask[keep] = True
+        return P, mask, residuals
+
     def project(self, pt_model: np.ndarray) -> np.ndarray:
         """Project one model point (3,) or many (N,3) to pixel coordinates."""
         pt = np.asarray(pt_model, dtype=np.float64)
@@ -94,6 +127,11 @@ class ProjectionMatrix:
         """Mean Euclidean pixel error of the fiducials (your registration quality gauge)."""
         proj = self.project(np.asarray(obj_pts, dtype=np.float64))
         return float(np.mean(np.linalg.norm(proj - np.asarray(img_pts, dtype=np.float64), axis=1)))
+
+    def per_point_errors(self, obj_pts: np.ndarray, img_pts: np.ndarray) -> np.ndarray:
+        """Per-fiducial reprojection error (px) — for flagging bearings to re-measure."""
+        proj = self.project(np.asarray(obj_pts, dtype=np.float64))
+        return np.linalg.norm(proj - np.asarray(img_pts, dtype=np.float64), axis=1)
 
     def tolist(self):
         return self.P.tolist()

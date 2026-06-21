@@ -189,8 +189,9 @@ class ModelScreen(Screen):
         self.status.configure(text="")
 
     def _check_registration(self):
-        """Fit a DLT from the current clicks and overlay where it predicts each
-        fiducial (red x).  Every x on its blue circle = good registration."""
+        """Fit a robust DLT from the current clicks, overlay where it predicts
+        each fiducial (red x), and flag bearings that don't fit — those are the
+        ones to re-click.  Every x on its blue circle = good registration."""
         from core.dlt import ProjectionMatrix
         try:
             fids = self._parse_fiducials()
@@ -208,16 +209,26 @@ class ModelScreen(Screen):
                 msgs.append(f"{config.XRAY_LABEL[r]}: {len(clicks)} clicks vs {n} fiducials - skipped")
                 self.canvas[r].set_predicted([])
                 continue
+            img = np.asarray(clicks, float)
             try:
-                P = ProjectionMatrix.from_correspondences(fids, np.asarray(clicks, float))
+                if n >= 7:
+                    P, mask, res = ProjectionMatrix.from_correspondences_robust(fids, img,
+                                                                                config.DLT_REPROJ_WARN_PX)
+                else:
+                    P = ProjectionMatrix.from_correspondences(fids, img)
+                    res = P.per_point_errors(fids, img); mask = np.ones(n, bool)
             except Exception as exc:  # noqa: BLE001
                 msgs.append(f"{config.XRAY_LABEL[r]}: DLT failed ({exc})")
                 continue
             self.canvas[r].set_predicted(P.project(fids).tolist())
-            err = P.reprojection_error(fids, np.asarray(clicks, float))
-            flag = "" if err <= config.DLT_REPROJ_WARN_PX else "  (high)"
-            msgs.append(f"{config.XRAY_LABEL[r]}: mean error {err:.2f} px{flag}")
-        self.status.configure(text="Registration check:\n" + "\n".join(msgs))
+            inl = float(np.mean(res[mask])) if mask.any() else float(np.mean(res))
+            bad = [i for i in range(n) if not mask[i]]
+            line = f"{config.XRAY_LABEL[r]}: {inl:.2f} px on {int(mask.sum())}/{n} bearings"
+            if bad:
+                worst = ", ".join(f"#{i} ({res[i]:.0f}px)" for i in bad)
+                line += f"  \u2014 re-click: {worst}"
+            msgs.append(line)
+        self.status.configure(text="Registration check (robust):\n" + "\n".join(msgs))
 
     # ── compute / persist ──────────────────────────────────────────────────────
     def _compute_save(self):
@@ -249,8 +260,11 @@ class ModelScreen(Screen):
             except Exception as exc:  # noqa: BLE001
                 messagebox.showwarning("DLT", f"{config.ROLE_LABEL[r]}: {exc}")
                 return
+            v = reg.view(r)
+            bad = [i for i, ok in enumerate(v.inliers) if not ok]
             flag = "" if err <= config.DLT_REPROJ_WARN_PX else "  (high - check clicks/coords)"
-            msgs.append(f"{r.upper()} reprojection: {err:.2f} px{flag}")
+            extra = f"  \u2014 dropped bearings {bad} (re-click them)" if bad else ""
+            msgs.append(f"{r.upper()} reprojection: {err:.2f} px on {int(sum(v.inliers))}/{n}{flag}{extra}")
 
         reg.save()
         self.session.model = reg

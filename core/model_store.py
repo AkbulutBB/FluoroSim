@@ -37,6 +37,8 @@ class ViewData:
     clicks:     List[List[float]] = field(default_factory=list)   # (N,2) pixel
     P:          Optional[ProjectionMatrix] = None
     reproj_px:  Optional[float] = None
+    inliers:    List[bool] = field(default_factory=list)          # per-fiducial: kept?
+    residuals:  List[float] = field(default_factory=list)         # per-fiducial reproj px
 
 
 @dataclass
@@ -55,15 +57,30 @@ class ModelRegistration:
     def n_fiducials(self) -> int:
         return len(self.fiducials_model)
 
-    def compute_view(self, role: str) -> float:
-        """Fit the DLT for one view from its clicks; returns reprojection error (px)."""
+    def compute_view(self, role: str, robust: bool = True, thresh_px: float = 4.0) -> float:
+        """Fit the DLT for one view from its clicks; returns reprojection error (px).
+
+        With ``robust`` (default), bearings that don't fit the projection are
+        rejected so a couple of bad 3-D coordinates can't tilt the whole view.
+        Per-fiducial residuals and the inlier mask are stored for QA so you can
+        see exactly which bearings to re-measure.
+        """
         v = self.view(role)
         obj = np.asarray(self.fiducials_model, dtype=np.float64)
         img = np.asarray(v.clicks, dtype=np.float64)
         if len(obj) != len(img):
             raise ValueError("Number of fiducials and clicks must match.")
-        v.P = ProjectionMatrix.from_correspondences(obj, img)
-        v.reproj_px = v.P.reprojection_error(obj, img)
+        if robust and len(obj) >= 7:
+            v.P, mask, res = ProjectionMatrix.from_correspondences_robust(obj, img, thresh_px)
+            v.inliers = mask.tolist()
+            v.residuals = [float(x) for x in res]
+            v.reproj_px = float(np.mean(res[mask])) if mask.any() else float(np.mean(res))
+        else:
+            v.P = ProjectionMatrix.from_correspondences(obj, img)
+            res = v.P.per_point_errors(obj, img)
+            v.inliers = [True] * len(obj)
+            v.residuals = [float(x) for x in res]
+            v.reproj_px = float(np.mean(res))
         return v.reproj_px
 
     @property
@@ -91,6 +108,8 @@ class ModelRegistration:
                 "clicks": [list(map(float, c)) for c in v.clicks],
                 "P": v.P.tolist() if v.P is not None else None,
                 "reproj_px": v.reproj_px,
+                "inliers": list(map(bool, v.inliers)),
+                "residuals": [float(x) for x in v.residuals],
             }
 
         with open(fn, "w") as f:
@@ -114,7 +133,9 @@ class ModelRegistration:
             P = ProjectionMatrix.fromlist(vd["P"]) if vd.get("P") else None
             return ViewData(image_path=img_abs,
                             clicks=[list(map(float, c)) for c in vd.get("clicks", [])],
-                            P=P, reproj_px=vd.get("reproj_px"))
+                            P=P, reproj_px=vd.get("reproj_px"),
+                            inliers=[bool(x) for x in vd.get("inliers", [])],
+                            residuals=[float(x) for x in vd.get("residuals", [])])
 
         return cls(
             name=d.get("name", "untitled"),
