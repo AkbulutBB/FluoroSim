@@ -74,11 +74,18 @@ class ModelScreen(Screen):
         ttk.Separator(left).pack(fill="x", pady=8)
         ttk.Button(left, text="Check registration", command=self._check_registration).pack(anchor="w", fill="x")
         ttk.Button(left, text="Clear check", command=self._clear_check).pack(anchor="w", fill="x", pady=6)
-        ttk.Label(left, text="blue \u25cb = your clicks   red \u00d7 = model prediction.\n"
-                             "Good registration: every \u00d7 sits on its \u25cb.",
+        ttk.Label(left, text="blue \u25cb = your clicks   green \u00d7 = good fit\n"
+                             "red \u00d7 + line = bearing to re-click.",
                   style="Muted.TLabel", wraplength=240, justify="left").pack(anchor="w")
-        self.status = ttk.Label(left, text="", style="Muted.TLabel", wraplength=240, justify="left")
-        self.status.pack(anchor="w", pady=10)
+        status_box = ttk.Frame(left, style="App.TFrame")
+        status_box.pack(anchor="w", fill="x", pady=10)
+        self.status = tk.Text(status_box, width=30, height=8, bg=W.PANEL, fg=W.FG,
+                              relief="flat", wrap="word", state="disabled",
+                              highlightthickness=0, font=("Segoe UI", 9))
+        sb = ttk.Scrollbar(status_box, orient="vertical", command=self.status.yview)
+        self.status.configure(yscrollcommand=sb.set)
+        self.status.pack(side="left", fill="x", expand=True)
+        sb.pack(side="right", fill="y")
 
         # right column: AP / LAT image tabs
         self.nb = ttk.Notebook(body)
@@ -105,6 +112,13 @@ class ModelScreen(Screen):
         bar.pack(fill="x", padx=16, pady=12)
         ttk.Button(bar, text="\u2190 Home", command=lambda: self.app.show("home")).pack(side="left")
         ttk.Label(bar, text="Model registration", style="H2.TLabel").pack(side="left", padx=14)
+
+    def _set_status(self, text: str):
+        self.status.configure(state="normal")
+        self.status.delete("1.0", "end")
+        self.status.insert("1.0", text)
+        self.status.configure(state="disabled")
+        self.status.see("1.0")
 
     # ── data helpers ──────────────────────────────────────────────────────────
     def _parse_fiducials(self) -> np.ndarray:
@@ -186,7 +200,7 @@ class ModelScreen(Screen):
     def _clear_check(self):
         for r in config.CAMERA_ROLES:
             self.canvas[r].set_predicted([])
-        self.status.configure(text="")
+        self._set_status("")
 
     def _check_registration(self):
         """Fit a robust DLT from the current clicks, overlay where it predicts
@@ -220,15 +234,15 @@ class ModelScreen(Screen):
             except Exception as exc:  # noqa: BLE001
                 msgs.append(f"{config.XRAY_LABEL[r]}: DLT failed ({exc})")
                 continue
-            self.canvas[r].set_predicted(P.project(fids).tolist())
             inl = float(np.mean(res[mask])) if mask.any() else float(np.mean(res))
             bad = [i for i in range(n) if not mask[i]]
+            self.canvas[r].set_predicted(P.project(fids).tolist(), outliers=bad)
             line = f"{config.XRAY_LABEL[r]}: {inl:.2f} px on {int(mask.sum())}/{n} bearings"
             if bad:
-                worst = ", ".join(f"#{i} ({res[i]:.0f}px)" for i in bad)
+                worst = ", ".join(f"#{i + 1} ({res[i]:.0f}px)" for i in bad)
                 line += f"  \u2014 re-click: {worst}"
             msgs.append(line)
-        self.status.configure(text="Registration check (robust):\n" + "\n".join(msgs))
+        self._set_status("Registration check (robust):\n" + "\n".join(msgs))
 
     # ── compute / persist ──────────────────────────────────────────────────────
     def _compute_save(self):
@@ -261,14 +275,14 @@ class ModelScreen(Screen):
                 messagebox.showwarning("DLT", f"{config.ROLE_LABEL[r]}: {exc}")
                 return
             v = reg.view(r)
-            bad = [i for i, ok in enumerate(v.inliers) if not ok]
+            bad = [i + 1 for i, ok in enumerate(v.inliers) if not ok]
             flag = "" if err <= config.DLT_REPROJ_WARN_PX else "  (high - check clicks/coords)"
             extra = f"  \u2014 dropped bearings {bad} (re-click them)" if bad else ""
             msgs.append(f"{r.upper()} reprojection: {err:.2f} px on {int(sum(v.inliers))}/{n}{flag}{extra}")
 
         reg.save()
         self.session.model = reg
-        self.status.configure(text="Saved to data/models.\n" + "\n".join(msgs))
+        self._set_status("Saved to data/models.\n" + "\n".join(msgs))
 
     def _load_model(self):
         path = filedialog.askopenfilename(
@@ -295,8 +309,8 @@ class ModelScreen(Screen):
                 self.canvas[r].set_image(img)
                 self.canvas[r].set_points(v.clicks)
         self._update_counts()
-        self.status.configure(text=f"Loaded '{reg.name}'. "
-                                   + ("Complete." if reg.is_complete else "Incomplete - recompute."))
+        self._set_status(f"Loaded '{reg.name}'. "
+                         + ("Complete." if reg.is_complete else "Incomplete - recompute."))
 
     def on_show(self):
         if self.session.model is not None and not self.fid_text.get("1.0", "end").strip():

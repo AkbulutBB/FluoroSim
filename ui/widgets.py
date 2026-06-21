@@ -74,6 +74,7 @@ class ClickableImage(tk.Canvas):
         self._offx = self._offy = 0
         self._points: List[Tuple[float, float]] = []     # original-pixel coords
         self._predicted: List[Tuple[float, float]] = []   # DLT-reprojected fiducials
+        self._outliers: set = set()                        # indices flagged by robust fit
         self._orig_size = (0, 0)
         self._on_change = on_change
         self.bind("<Button-1>", self._add_point)
@@ -104,9 +105,15 @@ class ClickableImage(tk.Canvas):
         self._points = [tuple(map(float, p)) for p in pts]
         self._redraw()
 
-    def set_predicted(self, pts: List[Tuple[float, float]]):
-        """Overlay DLT-reprojected fiducials (red crosses) for the registration check."""
+    def set_predicted(self, pts: List[Tuple[float, float]], outliers=None):
+        """Overlay where the DLT predicts each fiducial, paired to your clicks.
+
+        A short green cross sitting on its blue circle = good. A red cross with
+        a line running off to its circle = that bearing doesn't fit (re-click
+        it); ``outliers`` are the indices the robust fit rejected.
+        """
         self._predicted = [tuple(map(float, p)) for p in pts]
+        self._outliers = set(int(i) for i in (outliers or []))
         self._redraw()
 
     # ---- internals ---------------------------------------------------------
@@ -142,15 +149,26 @@ class ClickableImage(tk.Canvas):
             self.create_oval(x - r, y - r, x + r, y + r, outline=ACCENT, width=2)
             self.create_text(x + 10, y - 10, text=str(i), fill=ACCENT,
                              font=("Segoe UI", 10, "bold"))
-        # registration-check crosses: where the saved DLT predicts each fiducial
-        for (ox, oy) in self._predicted:
+        # registration-check crosses, paired to the matching click by index.
+        for i, (ox, oy) in enumerate(self._predicted):
             if not (np.isfinite(ox) and np.isfinite(oy)):
                 continue
             x = self._offx + ox * self._scale
             y = self._offy + oy * self._scale
+            bad = i in self._outliers
+            col = BAD if bad else OK
+            # connector from this prediction to its click (same index)
+            if i < len(self._points):
+                px = self._offx + self._points[i][0] * self._scale
+                py = self._offy + self._points[i][1] * self._scale
+                self.create_line(px, py, x, y, fill=col,
+                                 width=2 if bad else 1,
+                                 dash=() if bad else (3, 2))
             r = 7
-            self.create_line(x - r, y, x + r, y, fill=BAD, width=2)
-            self.create_line(x, y - r, x, y + r, fill=BAD, width=2)
+            self.create_line(x - r, y, x + r, y, fill=col, width=2)
+            self.create_line(x, y - r, x, y + r, fill=col, width=2)
+            self.create_text(x + 11, y + 11, text=str(i + 1), fill=col,
+                             font=("Segoe UI", 9, "bold"))
 
 
 class StatusChip(ttk.Frame):
