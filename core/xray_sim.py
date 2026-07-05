@@ -271,7 +271,7 @@ class XRaySimulator:
         # ── Spine STL ──────────────────────────────────────────────────
         spine_path = Path(cfg.SPINE_STL_PATH)
         if spine_path.exists():
-            _gvxr.loadMeshFile(str(spine_path), "spine", "mm")
+            _gvxr.loadMeshFile("spine", str(spine_path), "mm")
             logger.info("Loaded spine STL: %s", spine_path)
         else:
             logger.warning("Spine STL not found (%s) — using cuboid placeholder.", spine_path)
@@ -290,7 +290,7 @@ class XRaySimulator:
         plat_str  = getattr(cfg, 'PLATFORM_STL_PATH', '') or ''
         plat_path = Path(plat_str) if plat_str else None
         if plat_path and plat_path.exists():
-            _gvxr.loadMeshFile(str(plat_path), "platform", "mm")
+            _gvxr.loadMeshFile("platform", str(plat_path), "mm")
             _gvxr.setCompound("platform", "C2H4")   # PETG ≈ polyethylene
             _gvxr.setDensity ("platform", 1.27, "g/cm3")
             self._registered_meshes.append("platform")
