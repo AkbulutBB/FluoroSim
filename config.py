@@ -158,9 +158,25 @@ GVXR_ISOCENTER   = (0.0, 40.0, 50.0)   # fixed working-volume centre (mm)
 GVXR_SOD_MM      = 1000.0              # source-to-isocentre distance
 GVXR_DET_OFFSET_MM = 50.0             # detector offset past isocentre
 
-# AP: beam along board +Y (probe inserted along Y → foreshortens to a dot).
-GVXR_AP_BEAM_DIR = (0.0,  1.0, 0.0)
-GVXR_AP_UP       = (0.0,  0.0, -1.0)   # image "up" = -Z, so caudal(+Z) reads down
+# AP: beam along board Z, NOT the original +Y assumption above the old
+# comment described. Evidence: with beam along Y, the AP render showed a
+# single compressed axial "ring" (pedicles/spinous process/vertebral body
+# all collapsed into one silhouette, no sense of separate levels) — that's
+# what beam-along-the-craniocaudal-axis looks like, not true AP. Lateral
+# (beam along X) is independently confirmed correct, so by elimination Z
+# is anterior-posterior. Up-vector is Y (craniocaudal) so both AP and LAT
+# share the same vertical convention.
+#
+# STATUS: this is the leading hypothesis, not yet visually confirmed on a
+# clean render — every attempt to check it so far got confounded by a
+# separate gVXR/OpenGL context-reuse bug (same Spyder kernel, second run
+# onward silently produces garbage "shader programs not valid" renders).
+# Restart the kernel before judging any render against this. If it's wrong,
+# try flipping signs first (GVXR_AP_BEAM_DIR = (0,0,-1) and/or
+# GVXR_AP_UP = (0,-1,0)) before assuming the axis itself is wrong again —
+# sign flips only mirror the image, wrong axis produces the ring artifact.
+GVXR_AP_BEAM_DIR = (0.0,  0.0, 1.0)
+GVXR_AP_UP       = (0.0,  1.0, 0.0)
 
 # Lateral: beam along board -X (probe shows full length, pointing top→bottom).
 GVXR_LAT_BEAM_DIR = (-1.0, 0.0, 0.0)

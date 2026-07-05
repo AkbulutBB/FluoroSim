@@ -88,25 +88,6 @@ except ImportError:
 DEFAULT_OUTDIR = Path("outputs/stl_preview")
 
 
-def parse_axis(spec: str) -> tuple[float, float, float]:
-    """
-    Parse a signed-axis spec like 'x', '-x', '+y', 'z' into a unit vector.
-    Lets an orientation hypothesis (e.g. "AP beam is actually along Z, not
-    Y") be tested directly against a render instead of hard-coded and
-    guessed at.
-    """
-    s = spec.strip().lower()
-    sign = -1.0 if s.startswith("-") else 1.0
-    axis = s.lstrip("+-")
-    if axis not in ("x", "y", "z"):
-        raise argparse.ArgumentTypeError(
-            f"invalid axis spec {spec!r} — use one of: x -x +x y -y +y z -z +z"
-        )
-    vec = [0.0, 0.0, 0.0]
-    vec["xyz".index(axis)] = sign
-    return tuple(vec)
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument(
@@ -115,7 +96,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--clip-mm", type=float, default=8.0,
                     help="mm to remove from the bottom (platform attachment "
-                         "plate). Default 8.0. Use --no-clip to disable.")
+                         "plate). Default 6.0. Use --no-clip to disable.")
     p.add_argument("--no-clip", action="store_true",
                     help="Skip clipping entirely; render the STL as-is.")
     p.add_argument("--up-axis", choices=["x", "y", "z"], default="z",
@@ -135,18 +116,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sod-mm", type=float, default=cfg.GVXR_SOD_MM,
                     help="Source-to-isocentre distance.")
     p.add_argument("--det-offset-mm", type=float, default=cfg.GVXR_DET_OFFSET_MM)
-    p.add_argument("--ap-beam", type=parse_axis, default=None,
-                    help="Override AP beam direction, e.g. 'z' or '-x'. "
-                         f"Default from config.py: {cfg.GVXR_AP_BEAM_DIR}.")
-    p.add_argument("--ap-up", type=parse_axis, default=None,
-                    help="Override AP up-vector. "
-                         f"Default from config.py: {cfg.GVXR_AP_UP}.")
-    p.add_argument("--lat-beam", type=parse_axis, default=None,
-                    help="Override lateral beam direction. "
-                         f"Default from config.py: {cfg.GVXR_LAT_BEAM_DIR}.")
-    p.add_argument("--lat-up", type=parse_axis, default=None,
-                    help="Override lateral up-vector. "
-                         f"Default from config.py: {cfg.GVXR_LAT_UP}.")
     p.add_argument("--outdir", default=str(DEFAULT_OUTDIR))
     return p.parse_args()
 
@@ -218,18 +187,12 @@ def build_preview_cfg(
     sod_mm: float,
     det_offset_mm: float,
     isocenter_local: np.ndarray,
-    ap_beam: tuple[float, float, float] | None = None,
-    ap_up: tuple[float, float, float] | None = None,
-    lat_beam: tuple[float, float, float] | None = None,
-    lat_up: tuple[float, float, float] | None = None,
 ) -> SimpleNamespace:
     """
     Build a lightweight config namespace for XRaySimulator that renders ONLY
     the given STL — no platform, no bearings, no board registration.
     Reuses config.py's AP/LAT beam directions and context type so the
-    preview matches the real pipeline's viewing convention, unless
-    overridden (ap_beam/ap_up/lat_beam/lat_up) for testing an orientation
-    hypothesis.
+    preview matches the real pipeline's viewing convention.
     """
     return SimpleNamespace(
         GVXR_CONTEXT=cfg.GVXR_CONTEXT,
@@ -242,10 +205,10 @@ def build_preview_cfg(
         GVXR_ISOCENTER=tuple(float(v) for v in isocenter_local),
         GVXR_SOD_MM=sod_mm,
         GVXR_DET_OFFSET_MM=det_offset_mm,
-        GVXR_AP_BEAM_DIR=ap_beam if ap_beam is not None else cfg.GVXR_AP_BEAM_DIR,
-        GVXR_AP_UP=ap_up if ap_up is not None else cfg.GVXR_AP_UP,
-        GVXR_LAT_BEAM_DIR=lat_beam if lat_beam is not None else cfg.GVXR_LAT_BEAM_DIR,
-        GVXR_LAT_UP=lat_up if lat_up is not None else cfg.GVXR_LAT_UP,
+        GVXR_AP_BEAM_DIR=cfg.GVXR_AP_BEAM_DIR,
+        GVXR_AP_UP=cfg.GVXR_AP_UP,
+        GVXR_LAT_BEAM_DIR=cfg.GVXR_LAT_BEAM_DIR,
+        GVXR_LAT_UP=cfg.GVXR_LAT_UP,
         GVXR_DETECTOR_PIXELS=(pixels, pixels),
         GVXR_PIXEL_SIZE_MM=pixel_size_mm,
         GVXR_ENERGY_MEV=energy_mev,
@@ -303,21 +266,10 @@ def main() -> int:
           f"{args.pixel_size_mm} mm/px  "
           f"({args.pixels * args.pixel_size_mm:.0f} mm FOV)")
 
-    ap_beam = args.ap_beam if args.ap_beam is not None else cfg.GVXR_AP_BEAM_DIR
-    ap_up = args.ap_up if args.ap_up is not None else cfg.GVXR_AP_UP
-    lat_beam = args.lat_beam if args.lat_beam is not None else cfg.GVXR_LAT_BEAM_DIR
-    lat_up = args.lat_up if args.lat_up is not None else cfg.GVXR_LAT_UP
-    print(f"AP  beam/up   : {ap_beam} / {ap_up}"
-          f"{'  (override)' if args.ap_beam is not None or args.ap_up is not None else '  (from config.py)'}")
-    print(f"LAT beam/up   : {lat_beam} / {lat_up}"
-          f"{'  (override)' if args.lat_beam is not None or args.lat_up is not None else '  (from config.py)'}")
-
     preview_cfg = build_preview_cfg(
         render_path, args.compound, args.density,
         args.pixels, args.pixel_size_mm, args.energy_mev, args.photon_count,
         args.sod_mm, args.det_offset_mm, isocenter_local,
-        ap_beam=args.ap_beam, ap_up=args.ap_up,
-        lat_beam=args.lat_beam, lat_up=args.lat_up,
     )
 
     sim = XRaySimulator(preview_cfg)
