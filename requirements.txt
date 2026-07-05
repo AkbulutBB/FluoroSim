@@ -1,5 +1,4 @@
-# FluoroSim dependencies
-# Pinned OpenCV for numpy ABI compatibility (your known-good combination).
 opencv-contrib-python==4.9.0.80
 numpy<2
-pillow>=9.0
+Pillow
+gvxr
