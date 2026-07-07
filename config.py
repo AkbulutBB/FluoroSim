@@ -130,7 +130,17 @@ PLATFORM_STL_PATH = ""           # set to "models/platform.stl" if available
 # For a PETG-printed model without bone-equivalent coating, use:
 #     SPINE_MATERIAL_COMPOUND = "C5H8O2"  ;  SPINE_MATERIAL_DENSITY = 1.27
 SPINE_MATERIAL_COMPOUND = "Ca10(PO4)6(OH)2"   # hydroxyapatite
-SPINE_MATERIAL_DENSITY  = 1.92                 # g/cm³
+SPINE_MATERIAL_DENSITY  = 1.92                 # g/cm³  (cortical shell)
+
+# Trabecular core (only used when SPINE_SHELL_STL_PATH/SPINE_CORE_STL_PATH
+# are both set — see tools/stl_xray_preview.py's split_shell_core()).
+# 0.35 g/cm3 = top of the 0.09-0.35 g/cm3 range reported across studies of
+# vertebral trabecular apparent (wet) density; raised here from an initial
+# 0.2 (literature-range midpoint) after visual comparison showed more
+# contrast was preferred — this is a real, cited upper bound, not an
+# arbitrary contrast tweak.
+SPINE_TRABECULAR_COMPOUND = "Ca10(PO4)6(OH)2"
+SPINE_TRABECULAR_DENSITY  = 0.35               # g/cm³  (was 0.2)
 
 # Virtual C-arm geometry (mm, gVXR world = CAD platform space).
 #
@@ -196,18 +206,6 @@ GVXR_PIXEL_SIZE_MM   = 0.25          # isotropic pixel pitch (128 mm FOV total)
 # Beam parameters
 GVXR_ENERGY_MEV   = 0.08    # 80 keV — standard fluoroscopy energy
 GVXR_PHOTON_COUNT = 5000    # was 1000; higher = less Monte Carlo graininess, slower
-
-# Display windowing (percentile-based, not raw min/max). A naive full-range
-# stretch anchors on the cortical shell (highest attenuation) and compresses
-# the trabecular core (much lower attenuation) into a narrow band near
-# black — this is what caused the "hollow-looking core" appearance. This
-# mimics how real fluoro/radiography displays work: map a CHOSEN sub-range
-# to visible contrast and let outside-that-range saturate, rather than
-# showing the full raw dynamic range. Tune these two numbers against a real
-# render — the right window depends on how much of the frame is background
-# vs anatomy, which isn't something to guess from first principles.
-GVXR_WINDOW_LOW_PCT  = 2.0   # percentile mapped to pure white (densest tissue)
-GVXR_WINDOW_HIGH_PCT = 98.0  # percentile mapped to pure black (background)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CAD-derived registration values   ← FROM CAD (fill these in from Fusion 360)

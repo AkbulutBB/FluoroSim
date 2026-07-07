@@ -483,42 +483,14 @@ class XRaySimulator:
         _gvxr.setDetectorPixelSize(view.pixel_size_mm, view.pixel_size_mm, "mm")
         _gvxr.computeXRayImage()
         raw = np.array(_gvxr.getLastXRayImage())
-        return self._to_display(raw, cfg)
+        return self._to_display(raw)
 
     @staticmethod
-    def _to_display(raw: np.ndarray, cfg) -> np.ndarray:
-        """
-        Log-compress energy fluence, window, invert -> anatomy bright on
-        dark background.
-
-        Windowing (not a plain min-max stretch) is the fix for cortical
-        shell + trabecular core renders looking "hollow" in the middle:
-        cortical bone (~1.92 g/cm3) attenuates roughly 10x more than
-        trabecular (~0.2 g/cm3), so a naive full-range stretch anchors on
-        the shell and compresses the core into a narrow band near black.
-        Real fluoro/radiography displays never show the raw full dynamic
-        range either — they window to a chosen sub-range and deliberately
-        saturate outside it, which is exactly why real images show
-        filled-in cancellous bone rather than "denser tissue = darker
-        empty-looking" the way the un-windowed version did here.
-
-        Percentile-based rather than fixed absolute bounds, since the log-
-        fluence range shifts with photon count/energy/geometry and a fixed
-        window would need re-tuning every time one of those changes; this
-        adapts automatically and still achieves the same "ignore extreme
-        outliers, stretch the range that matters" effect.
-        """
+    def _to_display(raw: np.ndarray) -> np.ndarray:
+        """Log-compress energy fluence, invert → anatomy bright on dark background."""
         safe = np.clip(raw, 1e-10, None)
         log  = np.log(safe)
-        lo_pct = getattr(cfg, 'GVXR_WINDOW_LOW_PCT', 2.0)
-        hi_pct = getattr(cfg, 'GVXR_WINDOW_HIGH_PCT', 98.0)
-        lo, hi = np.percentile(log, [lo_pct, hi_pct])
-        if hi <= lo:  # degenerate (near-flat image) — fall back to true min/max
-            lo, hi = float(log.min()), float(log.max())
-            if hi <= lo:
-                hi = lo + 1e-6
-        windowed = np.clip((log - lo) / (hi - lo), 0.0, 1.0)
-        norm = (windowed * 255).astype(np.uint8)
+        norm = cv2.normalize(log, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         return cv2.bitwise_not(norm)
 
     # ── Fast probe overlay (analytic projection, no re-render) ───────────

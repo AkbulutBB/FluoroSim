@@ -158,11 +158,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--shell-pitch-mm", type=float, default=0.2,
                     help="Voxel pitch for --shell-core-split. Finer = more "
                          "accurate, slower. Default 0.2mm.")
-    p.add_argument("--trabecular-density", type=float, default=0.2,
-                    help="Trabecular core density, g/cm3. Default 0.2 "
-                         "(midpoint of the 0.09-0.35 g/cm3 literature range "
-                         "for vertebral trabecular apparent density — tune "
-                         "within that range, not a precise figure).")
+    p.add_argument("--trabecular-density", type=float,
+                    default=getattr(cfg, "SPINE_TRABECULAR_DENSITY", 0.2),
+                    help=f"Trabecular core density, g/cm3. Default: "
+                         f"{getattr(cfg, 'SPINE_TRABECULAR_DENSITY', 0.2)} "
+                         f"(from config.py; literature range is roughly "
+                         f"0.09-0.35 g/cm3 for vertebral trabecular "
+                         f"apparent density).")
     p.add_argument("--shell-target-faces", type=int, default=30000,
                     help="Decimate shell/core meshes to ~this many faces "
                          "each after marching cubes (which produces far "
@@ -494,7 +496,7 @@ def build_preview_cfg(
     shell_path: Path | None = None,
     core_path: Path | None = None,
     trabecular_compound: str = "Ca10(PO4)6(OH)2",
-    trabecular_density: float = 0.2,
+    trabecular_density: float = 0.35,
 ) -> SimpleNamespace:
     """
     Build a lightweight config namespace for XRaySimulator that renders ONLY
@@ -506,10 +508,11 @@ def build_preview_cfg(
 
     shell_path/core_path: if both given (from split_shell_core()), the
     renderer uses the two-material shell+core mode instead of a single
-    uniform-density mesh. trabecular_density defaults to 0.2 g/cm3 — the
-    approximate midpoint of the 0.09-0.35 g/cm3 range reported across
-    studies of vertebral trabecular apparent (wet) density; tune within
-    that range rather than trusting 0.2 as precise.
+    uniform-density mesh. trabecular_density defaults to 0.35 g/cm3 — the
+    top of the 0.09-0.35 g/cm3 range reported across studies of vertebral
+    trabecular apparent (wet) density (raised from an initial 0.2 midpoint
+    after visual comparison favored more contrast — still within the cited
+    range, not an arbitrary number).
     """
     return SimpleNamespace(
         GVXR_CONTEXT=cfg.GVXR_CONTEXT,
