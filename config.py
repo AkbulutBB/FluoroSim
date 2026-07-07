@@ -184,11 +184,30 @@ GVXR_LAT_UP       = ( 0.0, 1.0, 0.0)   # image "up" = +Y
 
 # Detector parameters
 GVXR_DETECTOR_PIXELS = (512, 512)   # width × height
-GVXR_PIXEL_SIZE_MM   = 0.5          # isotropic pixel pitch (256 mm FOV total)
+# Pixel pitch chosen for the clipped model's actual footprint (~100 x 82 x
+# 76 mm from the last render). At 0.5 mm/px the 256 mm FOV left the object
+# under half the frame — most detector resolution was spent on empty
+# background. 0.25 mm/px -> 128 mm FOV: ~14 mm margin around the AP view's
+# widest axis (100 mm), ~23-26 mm margin on the others. If a future STL is
+# larger and gets clipped at the frame edge, raise this back up rather than
+# assuming the geometry is wrong.
+GVXR_PIXEL_SIZE_MM   = 0.25          # isotropic pixel pitch (128 mm FOV total)
 
 # Beam parameters
 GVXR_ENERGY_MEV   = 0.08    # 80 keV — standard fluoroscopy energy
-GVXR_PHOTON_COUNT = 1000    # photon count (higher = less noise, slower)
+GVXR_PHOTON_COUNT = 5000    # was 1000; higher = less Monte Carlo graininess, slower
+
+# Display windowing (percentile-based, not raw min/max). A naive full-range
+# stretch anchors on the cortical shell (highest attenuation) and compresses
+# the trabecular core (much lower attenuation) into a narrow band near
+# black — this is what caused the "hollow-looking core" appearance. This
+# mimics how real fluoro/radiography displays work: map a CHOSEN sub-range
+# to visible contrast and let outside-that-range saturate, rather than
+# showing the full raw dynamic range. Tune these two numbers against a real
+# render — the right window depends on how much of the frame is background
+# vs anatomy, which isn't something to guess from first principles.
+GVXR_WINDOW_LOW_PCT  = 2.0   # percentile mapped to pure white (densest tissue)
+GVXR_WINDOW_HIGH_PCT = 98.0  # percentile mapped to pure black (background)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CAD-derived registration values   ← FROM CAD (fill these in from Fusion 360)

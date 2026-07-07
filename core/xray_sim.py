@@ -233,6 +233,19 @@ class XRaySimulator:
             self._configure_renderer(self._ap)
             self._register_all_meshes()
 
+            # Reduces salt-and-pepper noise from numerical imperfections in
+            # the mesh (degenerate triangles, inconsistent normals at a cut
+            # face from a boolean clip) — gVXR's own docs describe this as
+            # "always useful if there are dodgy meshes", which describes our
+            # boolean-clipped spine STL exactly. GPU variant used for speed;
+            # enableArtefactFilteringOnCPU() exists if this ever needs to be
+            # more thorough at the cost of render time.
+            try:
+                _gvxr.enableArtefactFilteringOnGPU()
+            except Exception:
+                logger.warning("enableArtefactFilteringOnGPU() unavailable "
+                                "in this gVXR build — continuing without it.")
+
             self._ready = True
             try:
                 renderer = _gvxr.getOpenGlRenderer()
@@ -269,22 +282,53 @@ class XRaySimulator:
         cfg = self._cfg
 
         # ── Spine STL ──────────────────────────────────────────────────
-        spine_path = Path(cfg.SPINE_STL_PATH)
-        if spine_path.exists():
-            _gvxr.loadMeshFile("spine", str(spine_path), "mm")
-            logger.info("Loaded spine STL: %s", spine_path)
+        # Two modes, chosen automatically:
+        #   (a) shell/core: SPINE_SHELL_STL_PATH + SPINE_CORE_STL_PATH both
+        #       set and present on disk -> two meshes, two materials
+        #       (cortical shell + trabecular core), from split_shell_core()
+        #       in tools/stl_xray_preview.py.
+        #   (b) single mesh: original behavior, completely unchanged,
+        #       whenever (a)'s paths aren't both configured.
+        shell_str = getattr(cfg, 'SPINE_SHELL_STL_PATH', '') or ''
+        core_str  = getattr(cfg, 'SPINE_CORE_STL_PATH', '') or ''
+        shell_path = Path(shell_str) if shell_str else None
+        core_path  = Path(core_str) if core_str else None
+
+        if shell_path and shell_path.exists() and core_path and core_path.exists():
+            _gvxr.loadMeshFile("spine_shell", str(shell_path), "mm")
+            _gvxr.setCompound("spine_shell", cfg.SPINE_MATERIAL_COMPOUND)
+            _gvxr.setDensity ("spine_shell", cfg.SPINE_MATERIAL_DENSITY, "g/cm3")
+
+            _gvxr.loadMeshFile("spine_core", str(core_path), "mm")
+            _gvxr.setCompound("spine_core", getattr(
+                cfg, 'SPINE_TRABECULAR_COMPOUND', cfg.SPINE_MATERIAL_COMPOUND))
+            _gvxr.setDensity ("spine_core", getattr(
+                cfg, 'SPINE_TRABECULAR_DENSITY', 0.2), "g/cm3")
+
+            ox, oy, oz = (float(v) for v in cfg.SPINE_ORIGIN_IN_WORLD)
+            _gvxr.translateNode("spine_shell", ox, oy, oz, "mm")
+            _gvxr.translateNode("spine_core",  ox, oy, oz, "mm")
+            self._registered_meshes.append("spine_shell")
+            self._registered_meshes.append("spine_core")
+            logger.info("Loaded spine as shell+core: %s / %s", shell_path, core_path)
+
         else:
-            logger.warning("Spine STL not found (%s) — using cuboid placeholder.", spine_path)
-            _gvxr.makeCuboid("spine", 80, 60, 40, "mm")
-            _gvxr.moveToCentre("spine")
+            spine_path = Path(cfg.SPINE_STL_PATH)
+            if spine_path.exists():
+                _gvxr.loadMeshFile("spine", str(spine_path), "mm")
+                logger.info("Loaded spine STL: %s", spine_path)
+            else:
+                logger.warning("Spine STL not found (%s) — using cuboid placeholder.", spine_path)
+                _gvxr.makeCuboid("spine", 80, 60, 40, "mm")
+                _gvxr.moveToCentre("spine")
 
-        _gvxr.setCompound("spine", cfg.SPINE_MATERIAL_COMPOUND)
-        _gvxr.setDensity ("spine", cfg.SPINE_MATERIAL_DENSITY, "g/cm3")
+            _gvxr.setCompound("spine", cfg.SPINE_MATERIAL_COMPOUND)
+            _gvxr.setDensity ("spine", cfg.SPINE_MATERIAL_DENSITY, "g/cm3")
 
-        # Translate to hard-stop seated position (from CAD)
-        ox, oy, oz = (float(v) for v in cfg.SPINE_ORIGIN_IN_WORLD)
-        _gvxr.translateNode("spine", ox, oy, oz, "mm")
-        self._registered_meshes.append("spine")
+            # Translate to hard-stop seated position (from CAD)
+            ox, oy, oz = (float(v) for v in cfg.SPINE_ORIGIN_IN_WORLD)
+            _gvxr.translateNode("spine", ox, oy, oz, "mm")
+            self._registered_meshes.append("spine")
 
         # ── Platform STL (optional) ────────────────────────────────────
         plat_str  = getattr(cfg, 'PLATFORM_STL_PATH', '') or ''
@@ -439,14 +483,42 @@ class XRaySimulator:
         _gvxr.setDetectorPixelSize(view.pixel_size_mm, view.pixel_size_mm, "mm")
         _gvxr.computeXRayImage()
         raw = np.array(_gvxr.getLastXRayImage())
-        return self._to_display(raw)
+        return self._to_display(raw, cfg)
 
     @staticmethod
-    def _to_display(raw: np.ndarray) -> np.ndarray:
-        """Log-compress energy fluence, invert → anatomy bright on dark background."""
+    def _to_display(raw: np.ndarray, cfg) -> np.ndarray:
+        """
+        Log-compress energy fluence, window, invert -> anatomy bright on
+        dark background.
+
+        Windowing (not a plain min-max stretch) is the fix for cortical
+        shell + trabecular core renders looking "hollow" in the middle:
+        cortical bone (~1.92 g/cm3) attenuates roughly 10x more than
+        trabecular (~0.2 g/cm3), so a naive full-range stretch anchors on
+        the shell and compresses the core into a narrow band near black.
+        Real fluoro/radiography displays never show the raw full dynamic
+        range either — they window to a chosen sub-range and deliberately
+        saturate outside it, which is exactly why real images show
+        filled-in cancellous bone rather than "denser tissue = darker
+        empty-looking" the way the un-windowed version did here.
+
+        Percentile-based rather than fixed absolute bounds, since the log-
+        fluence range shifts with photon count/energy/geometry and a fixed
+        window would need re-tuning every time one of those changes; this
+        adapts automatically and still achieves the same "ignore extreme
+        outliers, stretch the range that matters" effect.
+        """
         safe = np.clip(raw, 1e-10, None)
         log  = np.log(safe)
-        norm = cv2.normalize(log, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        lo_pct = getattr(cfg, 'GVXR_WINDOW_LOW_PCT', 2.0)
+        hi_pct = getattr(cfg, 'GVXR_WINDOW_HIGH_PCT', 98.0)
+        lo, hi = np.percentile(log, [lo_pct, hi_pct])
+        if hi <= lo:  # degenerate (near-flat image) — fall back to true min/max
+            lo, hi = float(log.min()), float(log.max())
+            if hi <= lo:
+                hi = lo + 1e-6
+        windowed = np.clip((log - lo) / (hi - lo), 0.0, 1.0)
+        norm = (windowed * 255).astype(np.uint8)
         return cv2.bitwise_not(norm)
 
     # ── Fast probe overlay (analytic projection, no re-render) ───────────

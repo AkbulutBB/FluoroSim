@@ -107,7 +107,7 @@ def parse_axis(spec: str) -> tuple[float, float, float]:
     return tuple(vec)
 
 
-def parse_args() -> argparse.Namespace:
+def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument(
         "stl_path", nargs="?", default=None,
@@ -115,7 +115,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--clip-mm", type=float, default=8.0,
                     help="mm to remove from the bottom (platform attachment "
-                         "plate). Default 8.0. Use --no-clip to disable.")
+                         "plate). Default 6.0. Use --no-clip to disable.")
     p.add_argument("--no-clip", action="store_true",
                     help="Skip clipping entirely; render the STL as-is.")
     p.add_argument("--up-axis", choices=["x", "y", "z"], default="z",
@@ -147,8 +147,86 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lat-up", type=parse_axis, default=None,
                     help="Override lateral up-vector. "
                          f"Default from config.py: {cfg.GVXR_LAT_UP}.")
+    p.add_argument("--shell-core-split", action="store_true",
+                    help="Split the clipped mesh into a cortical shell + "
+                         "trabecular core (two densities) instead of one "
+                         "uniform-density mesh. See split_shell_core().")
+    p.add_argument("--shell-mm", type=float, default=1.0,
+                    help="Cortical shell thickness for --shell-core-split. "
+                         "Default 1.0mm (see Chawla/Odeh pedicle+posterior-"
+                         "element data discussed for this project).")
+    p.add_argument("--shell-pitch-mm", type=float, default=0.2,
+                    help="Voxel pitch for --shell-core-split. Finer = more "
+                         "accurate, slower. Default 0.2mm.")
+    p.add_argument("--trabecular-density", type=float, default=0.2,
+                    help="Trabecular core density, g/cm3. Default 0.2 "
+                         "(midpoint of the 0.09-0.35 g/cm3 literature range "
+                         "for vertebral trabecular apparent density — tune "
+                         "within that range, not a precise figure).")
+    p.add_argument("--shell-target-faces", type=int, default=30000,
+                    help="Decimate shell/core meshes to ~this many faces "
+                         "each after marching cubes (which produces far "
+                         "more detail than needed). Default 30000.")
     p.add_argument("--outdir", default=str(DEFAULT_OUTDIR))
-    return p.parse_args()
+    return p
+
+
+def parse_args() -> argparse.Namespace:
+    return _build_arg_parser().parse_args()
+
+
+def prompt_args() -> argparse.Namespace:
+    """
+    Interactive fallback for Spyder's Run button (F5) — when the script is
+    launched that way, sys.argv has no extra arguments, and configuring
+    Spyder's "command line arguments" run-config each time is exactly the
+    friction this is meant to avoid.
+
+    Prompts only for the handful of parameters actually worth changing
+    run-to-run right now (STL path, clip depth/axis, shell/core split).
+    Everything else — beam axes, pixel size, photon count, energy — keeps
+    the exact defaults from _build_arg_parser(), i.e. the values already
+    confirmed working and baked into config.py; those are still reachable
+    via real --flags from a terminal if you ever need to override them,
+    this path just isn't the place to re-litigate them every run.
+
+    Press Enter on any prompt to keep the default shown in [brackets].
+    """
+    args = _build_arg_parser().parse_args([])  # every field at its default
+
+    def ask(prompt: str, default, cast=str):
+        raw = input(f"{prompt} [{default}]: ").strip()
+        if not raw:
+            return default
+        try:
+            return cast(raw)
+        except Exception:
+            print(f"  couldn't parse {raw!r} — keeping default {default!r}")
+            return default
+
+    print("=" * 60)
+    print("FluoroSim — STL X-ray Preview (interactive mode)")
+    print("No command-line arguments detected — prompting instead.")
+    print("Press Enter to accept each default. Pass --flags from a")
+    print("terminal to skip this and use the non-interactive CLI.")
+    print("=" * 60)
+
+    stl_default = args.stl_path or cfg.SPINE_STL_PATH
+    args.stl_path = ask("STL path", stl_default, str)
+    args.clip_mm = ask("Clip depth, mm (0 = no clip)", args.clip_mm, float)
+    args.no_clip = args.clip_mm <= 0
+    if not args.no_clip:
+        args.up_axis = ask("Up axis (x/y/z)", args.up_axis, str)
+
+    do_split = ask("Shell/core split? (y/n)", "n", str).lower().startswith("y")
+    args.shell_core_split = do_split
+    if do_split:
+        args.shell_mm = ask("Shell thickness, mm", args.shell_mm, float)
+        args.trabecular_density = ask(
+            "Trabecular density, g/cm3", args.trabecular_density, float)
+
+    print()
+    return args
 
 
 def clip_bottom(
@@ -207,6 +285,197 @@ def clip_bottom(
     return out_path, clipped.bounds
 
 
+def _ensure_outward(mesh: "trimesh.Trimesh") -> "trimesh.Trimesh":
+    """
+    Force outward-facing normals (positive signed volume). is_watertight()
+    passes regardless of winding direction, so an inside-out mesh can slip
+    through that check silently — caught this happening after decimation in
+    testing (a shell mesh reporting -237705.5 mm3), so this is called at
+    every point a mesh is about to be exported, not just after decimation.
+    """
+    if mesh.volume < 0:
+        mesh.invert()
+    return mesh
+
+
+def _decimate_and_repair(mesh: "trimesh.Trimesh", target_faces: int, label: str = "mesh") -> "trimesh.Trimesh":
+    """
+    Reduce a mesh to ~target_faces and repair the watertightness that
+    quadric decimation reliably breaks (confirmed in testing: decimating a
+    dense marching-cubes mesh left it non-watertight every time, and
+    trimesh's own merge_vertices/fix_normals/fill_holes did not recover it).
+    pymeshfix — already proven earlier in this project for exactly this
+    kind of defect — does recover it, at negligible volume cost (<0.1% in
+    testing).
+    """
+    if len(mesh.faces) <= target_faces:
+        return _ensure_outward(mesh)
+    import pymeshfix
+    print(f"  Decimating {label} ({len(mesh.faces)} -> ~{target_faces} faces)... ",
+          end="", flush=True)
+    t0 = time.perf_counter()
+    decimated = mesh.simplify_quadric_decimation(face_count=target_faces)
+    v = np.ascontiguousarray(decimated.vertices, dtype=np.float64)
+    f = np.ascontiguousarray(decimated.faces, dtype=np.int32)
+    tin = pymeshfix.PyTMesh()
+    tin.set_quiet(True)
+    tin.load_array(v, f)
+    tin.join_closest_components()
+    tin.fill_small_boundaries()
+    tin.clean(max_iters=10, inner_loops=3)
+    v2, f2 = tin.return_arrays()
+    fixed = trimesh.Trimesh(vertices=v2, faces=f2)
+    fixed = _ensure_outward(fixed)
+    print(f"done ({time.perf_counter() - t0:.1f}s, {len(fixed.faces)} faces)")
+    if not fixed.is_watertight:
+        raise RuntimeError(
+            f"Decimation to {target_faces} faces could not be repaired to "
+            "watertight. Try a higher target_faces."
+        )
+    return fixed
+
+
+def split_shell_core(
+    stl_path: Path,
+    shell_mm: float,
+    out_shell_path: Path,
+    out_core_path: Path,
+    pitch: float = 0.2,
+    target_faces: int = 30000,
+) -> tuple[Path, Path | None]:
+    """
+    Split a mesh into a cortical SHELL (within shell_mm of every surface
+    point) and a trabecular CORE (everything deeper), saving each as its
+    own STL.
+
+    Method: voxelize the solid, compute a Euclidean distance transform from
+    the boundary, threshold at shell_mm to get the core region, extract the
+    core as a mesh via marching cubes, then get the shell via manifold3d
+    boolean difference (outer minus core) — reusing the same boolean engine
+    already validated for platform-plate clipping, rather than a naive
+    normal-offset (which self-intersects on thin, concave geometry).
+
+    This degrades gracefully exactly where a naive offset would break: if a
+    local cross-section is thinner than 2*shell_mm (e.g. a thin pedicle
+    wall), the distance transform never exceeds shell_mm there, so that
+    region simply has NO core — i.e. it's correctly classified as fully
+    cortical, with no special-casing required. Verified against a tapering
+    wedge test case (thick end retains a core, thin end doesn't) before
+    this was wired in.
+
+    Returns (shell_path, core_path). core_path is None if no voxel in the
+    entire mesh is farther than shell_mm from every surface (the whole
+    object is thinner than 2*shell_mm everywhere) — in that case there's no
+    meaningful trabecular compartment and only a shell should be used.
+
+    pitch: voxel size in mm. Finer = more accurate but slower/more memory;
+    0.2mm was sufficient in testing to resolve ~1mm shell thickness against
+    a ~1180-face test mesh with <10% volume discretization error. If your
+    real spine mesh is much larger, consider profiling before committing to
+    a pitch — this is a real memory/time tradeoff, not a fixed constant.
+
+    target_faces: marching cubes on a voxel grid produces far more faces
+    than the shape needs (a small test object came out at 620k+ faces at
+    pitch=0.3mm) — decimated down to this count for both shell and core
+    before export. Quadric decimation reliably breaks watertightness on its
+    own (confirmed in testing); this repairs it with pymeshfix afterward
+    rather than trusting the decimated output directly.
+    """
+    if not TRIMESH_AVAILABLE:
+        raise RuntimeError("trimesh is required. pip install trimesh manifold3d "
+                            "scikit-image scipy --break-system-packages")
+    try:
+        from scipy import ndimage
+        from skimage import measure
+    except ImportError:
+        raise RuntimeError("scikit-image and scipy are required for shell/core "
+                            "splitting. pip install scikit-image scipy "
+                            "--break-system-packages")
+
+    mesh = trimesh.load_mesh(str(stl_path), force="mesh")
+    if not mesh.is_watertight:
+        raise RuntimeError(
+            f"{stl_path} is not watertight — shell/core split needs a valid "
+            "closed solid, same requirement as clip_bottom()."
+        )
+
+    print(f"  Voxelizing at {pitch}mm pitch (this is the slow step — a few "
+          "minutes is normal on a real spine-sized mesh, not a hang)... ",
+          end="", flush=True)
+    t0 = time.perf_counter()
+    vox = mesh.voxelized(pitch=pitch).fill()
+    occ = vox.matrix.astype(bool)
+    print(f"done ({time.perf_counter() - t0:.1f}s, "
+          f"{occ.shape[0]}x{occ.shape[1]}x{occ.shape[2]} voxels)")
+
+    print("  Computing distance transform... ", end="", flush=True)
+    t0 = time.perf_counter()
+    # Pad with a false border so marching_cubes always sees a closed boundary
+    # (without this, a core region touching the array edge would produce an
+    # open, non-watertight surface).
+    occ_p = np.pad(occ, 1, mode="constant", constant_values=False)
+    dist_mm = ndimage.distance_transform_edt(occ_p) * pitch
+    core_mask = dist_mm > shell_mm
+    print(f"done ({time.perf_counter() - t0:.1f}s)")
+
+    out_shell_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not core_mask.any():
+        print(f"  [info] no voxel exceeds {shell_mm} mm from every surface — "
+              "this mesh is thinner than 2x shell everywhere; treating the "
+              "whole thing as cortical, no core.")
+        _ensure_outward(mesh).export(str(out_shell_path))
+        return out_shell_path, None
+
+    print("  Extracting core surface (marching cubes)... ", end="", flush=True)
+    t0 = time.perf_counter()
+    verts, faces, _, _ = measure.marching_cubes(core_mask.astype(float), level=0.5)
+    core_verts_world = vox.indices_to_points(verts - 1.0)  # undo the pad offset
+    core = trimesh.Trimesh(vertices=core_verts_world, faces=faces)
+    core.merge_vertices()
+    core.fix_normals()  # marching_cubes winding direction isn't guaranteed
+    core = _ensure_outward(core)
+    print(f"done ({time.perf_counter() - t0:.1f}s, {len(core.faces)} raw faces)")
+
+    core = _decimate_and_repair(core, target_faces, label="core")
+
+    if not core.is_watertight:
+        raise RuntimeError(
+            "Extracted core is not watertight — try a finer --pitch. This "
+            "would reproduce the earlier white-render failure if used as-is."
+        )
+
+    print("  Boolean difference (shell = outer - core)... ", end="", flush=True)
+    t0 = time.perf_counter()
+    shell = trimesh.boolean.difference([mesh, core], engine="manifold")
+    shell = _ensure_outward(shell)
+    print(f"done ({time.perf_counter() - t0:.1f}s, {len(shell.faces)} faces)")
+    if not shell.is_watertight:
+        raise RuntimeError(
+            "Boolean difference (shell = outer - core) produced a "
+            "non-watertight result. Try a finer --pitch."
+        )
+    # NOT decimating the shell: confirmed in testing that decimating a thin
+    # (~1mm) sheet is a much harder case for quadric decimation than a
+    # thick solid, and can silently collapse the inner/outer surfaces
+    # together — is_watertight() still passes on the collapsed result, so
+    # it doesn't get caught by that check; it showed up as shell volume
+    # coming out equal to core volume, which is geometrically impossible
+    # for a thin shell. The shell doesn't need decimating anyway: its face
+    # count comes from `mesh` (the original, already-reasonable clipped
+    # STL) minus the now-small decimated core, not from marching cubes —
+    # core is the only thing that gets inflated to 600k+ faces.
+
+    out_core_path.parent.mkdir(parents=True, exist_ok=True)
+    shell.export(str(out_shell_path))
+    core.export(str(out_core_path))
+    print(f"  Shell: {out_shell_path}  ({len(shell.faces)} faces, "
+          f"volume {shell.volume:.1f} mm3)")
+    print(f"  Core:  {out_core_path}  ({len(core.faces)} faces, "
+          f"volume {core.volume:.1f} mm3)")
+    return out_shell_path, out_core_path
+
+
 def build_preview_cfg(
     stl_path: Path,
     compound: str,
@@ -222,6 +491,10 @@ def build_preview_cfg(
     ap_up: tuple[float, float, float] | None = None,
     lat_beam: tuple[float, float, float] | None = None,
     lat_up: tuple[float, float, float] | None = None,
+    shell_path: Path | None = None,
+    core_path: Path | None = None,
+    trabecular_compound: str = "Ca10(PO4)6(OH)2",
+    trabecular_density: float = 0.2,
 ) -> SimpleNamespace:
     """
     Build a lightweight config namespace for XRaySimulator that renders ONLY
@@ -230,13 +503,24 @@ def build_preview_cfg(
     preview matches the real pipeline's viewing convention, unless
     overridden (ap_beam/ap_up/lat_beam/lat_up) for testing an orientation
     hypothesis.
+
+    shell_path/core_path: if both given (from split_shell_core()), the
+    renderer uses the two-material shell+core mode instead of a single
+    uniform-density mesh. trabecular_density defaults to 0.2 g/cm3 — the
+    approximate midpoint of the 0.09-0.35 g/cm3 range reported across
+    studies of vertebral trabecular apparent (wet) density; tune within
+    that range rather than trusting 0.2 as precise.
     """
     return SimpleNamespace(
         GVXR_CONTEXT=cfg.GVXR_CONTEXT,
         SPINE_STL_PATH=str(stl_path),
+        SPINE_SHELL_STL_PATH=str(shell_path) if shell_path else "",
+        SPINE_CORE_STL_PATH=str(core_path) if core_path else "",
         PLATFORM_STL_PATH="",
         SPINE_MATERIAL_COMPOUND=compound,
         SPINE_MATERIAL_DENSITY=density,
+        SPINE_TRABECULAR_COMPOUND=trabecular_compound,
+        SPINE_TRABECULAR_DENSITY=trabecular_density,
         SPINE_ORIGIN_IN_WORLD=(0.0, 0.0, 0.0),
         BEARING_POSITIONS=[],
         GVXR_ISOCENTER=tuple(float(v) for v in isocenter_local),
@@ -254,7 +538,7 @@ def build_preview_cfg(
 
 
 def main() -> int:
-    args = parse_args()
+    args = prompt_args() if len(sys.argv) == 1 else parse_args()
 
     if not GVXR_AVAILABLE:
         print("gvxrPython3 is not importable in this environment. "
@@ -303,6 +587,25 @@ def main() -> int:
           f"{args.pixel_size_mm} mm/px  "
           f"({args.pixels * args.pixel_size_mm:.0f} mm FOV)")
 
+    shell_path = core_path = None
+    if args.shell_core_split:
+        print(f"Shell/core    : splitting at {args.shell_mm}mm "
+              f"(pitch {args.shell_pitch_mm}mm)")
+        try:
+            shell_path, core_path = split_shell_core(
+                render_path, args.shell_mm,
+                outdir / "spine_shell.stl", outdir / "spine_core.stl",
+                pitch=args.shell_pitch_mm, target_faces=args.shell_target_faces,
+            )
+        except RuntimeError as exc:
+            print(f"[FAILED] {exc}", file=sys.stderr)
+            return 1
+        if core_path is None:
+            print("  No trabecular core found — whole mesh is thinner than "
+                  f"2x{args.shell_mm}mm everywhere; rendering as fully "
+                  "cortical (falling back to single-material mode).")
+            shell_path = None  # fall back to build_preview_cfg's default path
+
     ap_beam = args.ap_beam if args.ap_beam is not None else cfg.GVXR_AP_BEAM_DIR
     ap_up = args.ap_up if args.ap_up is not None else cfg.GVXR_AP_UP
     lat_beam = args.lat_beam if args.lat_beam is not None else cfg.GVXR_LAT_BEAM_DIR
@@ -318,6 +621,8 @@ def main() -> int:
         args.sod_mm, args.det_offset_mm, isocenter_local,
         ap_beam=args.ap_beam, ap_up=args.ap_up,
         lat_beam=args.lat_beam, lat_up=args.lat_up,
+        shell_path=shell_path, core_path=core_path,
+        trabecular_density=args.trabecular_density,
     )
 
     sim = XRaySimulator(preview_cfg)
