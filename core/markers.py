@@ -253,12 +253,27 @@ class ProbeTracker:
 
         cv2.drawFrameAxes(out, cam_mtx, dist, pose.rvec, pose.tvec, 25.0)
 
-        # Project K-wire shaft
+        # Project K-wire shaft.
+        # A degenerate/diverged PnP solve can yield non-finite rvec/tvec, which
+        # makes projectPoints return NaN or +-inf. Casting those to int is
+        # undefined (RuntimeWarning: invalid value encountered in cast) and
+        # yields garbage pixel coordinates, so validate before drawing.
         pts3d = np.array([cfg.ROD_BASE_IN_PROBE, cfg.ROD_TIP_IN_PROBE], np.float32)
         proj, _ = cv2.projectPoints(pts3d, pose.rvec, pose.tvec, cam_mtx, dist)
-        proj = proj.reshape(-1, 2).astype(int)
-        cv2.line(out, tuple(proj[0]), tuple(proj[1]), cfg.OVERLAY_SHAFT_COLOR, 3, cv2.LINE_AA)
-        cv2.circle(out, tuple(proj[1]), 7, cfg.OVERLAY_TIP_COLOR, -1, cv2.LINE_AA)
+        proj = proj.reshape(-1, 2)
+
+        h, w = out.shape[:2]
+        # Generous bound: allow off-screen but reject absurd magnitudes that
+        # indicate a diverged solve rather than a probe merely out of view.
+        limit = 10 * max(h, w)
+        if np.all(np.isfinite(proj)) and np.all(np.abs(proj) < limit):
+            proj = proj.astype(int)
+            cv2.line(out, tuple(proj[0]), tuple(proj[1]),
+                     cfg.OVERLAY_SHAFT_COLOR, 3, cv2.LINE_AA)
+            cv2.circle(out, tuple(proj[1]), 7, cfg.OVERLAY_TIP_COLOR, -1, cv2.LINE_AA)
+        else:
+            cv2.putText(out, "Probe pose unstable", (16, 88),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 80, 255), 2)
 
         col = (80, 220, 80) if pose.rms_reproj < 15 else (0, 140, 255)
         cv2.putText(out, f"Probe: {pose.n_faces} faces  RMS {pose.rms_reproj:.1f}px",

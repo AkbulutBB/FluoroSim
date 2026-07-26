@@ -59,6 +59,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import config as cfg  # noqa: E402
 from core.xray_sim import XRaySimulator, GVXR_AVAILABLE  # noqa: E402
 
+# Bearings live on the platform, not the spine, and are off by default for
+# trainee-facing renders -- but they are the whole point of this test, so
+# force them on for this run only.
+cfg.RENDER_BEARINGS = True
+
 try:
     import trimesh
     TRIMESH_AVAILABLE = True
@@ -67,6 +72,44 @@ except ImportError:
     TRIMESH_AVAILABLE = False
 
 OUTDIR = Path("outputs/registration_test")
+
+# BGR (OpenCV order)
+GREEN = (0, 255, 0)
+
+
+def annotate_bearings(gray: np.ndarray, carm, bearings, world_to_spine) -> np.ndarray:
+    """
+    Draw a labelled green ring at each bearing's ANALYTICALLY projected pixel
+    position on a colour copy of the grayscale render.
+
+    gVXR output is an X-ray attenuation map — single-channel by physics — so a
+    bearing cannot be "coloured" inside the render itself. Instead we project
+    each bearing's known CAD position through the same pinhole geometry the
+    renderer used (VirtualCArm.project_point) and mark it.
+
+    This doubles as an independent cross-check: the ring is computed from the
+    transform chain + projection maths, while the white dot underneath it comes
+    from gVXR's ray-casting through the actual sphere mesh. If ring and dot
+    coincide, both paths agree. If they are offset, one of them is wrong — and
+    the pixel gap is a direct readout of the registration error.
+    """
+    rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    n_drawn = 0
+    for b in bearings:
+        pos_world = np.append(np.asarray(b["position_mm"], dtype=np.float64), 1.0)
+        pos_render = (np.asarray(world_to_spine, dtype=np.float64) @ pos_world)[:3]
+        px = carm.project_point(pos_render)
+        if px is None:
+            continue
+        col, row = px
+        # Ring, not filled disc — so the rendered bearing stays visible inside.
+        cv2.circle(rgb, (col, row), 10, GREEN, 1, cv2.LINE_AA)
+        cv2.putText(rgb, str(b["label"]), (col + 14, row + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, GREEN, 1, cv2.LINE_AA)
+        n_drawn += 1
+    cv2.putText(rgb, f"{n_drawn} bearing(s) in frame", (8, 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, GREEN, 1, cv2.LINE_AA)
+    return rgb
 
 
 def main() -> int:
@@ -84,20 +127,26 @@ def main() -> int:
           f"({'found' if spine_path.exists() else 'MISSING -> cuboid placeholder will be used'})")
     print(f"BOARD_TO_WORLD:\n{np.round(np.asarray(cfg.BOARD_TO_WORLD), 3)}")
     print(f"SPINE_TO_WORLD:\n{np.round(np.asarray(cfg.SPINE_TO_WORLD), 3)}")
-    print(f"Isocentre     : {cfg.GVXR_ISOCENTER}")
+    print(f"BOARD_TO_SPINE (derived, render frame):\n"
+          f"{np.round(np.asarray(cfg.BOARD_TO_SPINE), 3)}")
+    print(f"Isocentre     : {cfg.GVXR_ISOCENTER if cfg.GVXR_ISOCENTER is not None else 'AUTO (clipped spine bbox centre)'}")
+    print(f"Baseplate clip: {cfg.SPINE_CLIP_MM} mm along local {cfg.SPINE_CLIP_AXIS}")
     print(f"Bearings      : {len(cfg.BEARING_POSITIONS)} configured")
 
     if TRIMESH_AVAILABLE and spine_path.exists():
         try:
             m = trimesh.load_mesh(str(spine_path), force="mesh")
-            R = np.asarray(cfg.SPINE_TO_WORLD)[:3, :3]
-            t = np.asarray(cfg.SPINE_TO_WORLD)[:3, 3]
-            verts_world = (R @ m.vertices.T).T + t
-            print(f"Spine bbox (world, via SPINE_TO_WORLD): "
-                  f"min={verts_world.min(axis=0).round(1)}  "
-                  f"max={verts_world.max(axis=0).round(1)}")
+            print(f"Spine bbox (spine-local = RENDER frame, unclipped): "
+                  f"min={m.bounds[0].round(1)}  max={m.bounds[1].round(1)}")
         except Exception as exc:
             print(f"  (bbox check skipped: {exc})")
+
+    # Where does the ChArUco board origin land in the render frame? This is the
+    # single number that ties the tracker to the anatomy -- if it is nowhere
+    # near the spine bbox above, the probe will render in the wrong place.
+    board_origin_render = (np.asarray(cfg.BOARD_TO_SPINE)
+                           @ np.array([0.0, 0.0, 0.0, 1.0]))[:3]
+    print(f"ChArUco origin in render frame: {board_origin_render.round(2)}")
 
     OUTDIR.mkdir(parents=True, exist_ok=True)
 
@@ -121,19 +170,31 @@ def main() -> int:
     cv2.imwrite(str(ap_path), ap_img)
     cv2.imwrite(str(lat_path), lat_img)
 
+    # Annotated copies: green labelled rings at the analytically projected
+    # bearing positions. Compare ring vs rendered white dot -- see docstring.
+    w2s = np.asarray(cfg.WORLD_TO_SPINE, dtype=np.float64)
+    ap_annot_path = OUTDIR / "ap_background_bearings.png"
+    lat_annot_path = OUTDIR / "lat_background_bearings.png"
+    cv2.imwrite(str(ap_annot_path),
+                annotate_bearings(ap_img, sim._ap, cfg.BEARING_POSITIONS, w2s))
+    cv2.imwrite(str(lat_annot_path),
+                annotate_bearings(lat_img, sim._lat, cfg.BEARING_POSITIONS, w2s))
+
     # ── Numeric bearing-projection check ────────────────────────────────
     print("\nBearing projection check:")
     npix = cfg.GVXR_DETECTOR_PIXELS
     n_in_ap = n_in_lat = 0
+    w2s = np.asarray(cfg.WORLD_TO_SPINE, dtype=np.float64)
     for b in cfg.BEARING_POSITIONS:
-        pos = np.array(b["position_mm"], dtype=np.float64)
+        pos_world = np.append(np.array(b["position_mm"], dtype=np.float64), 1.0)
+        pos = (w2s @ pos_world)[:3]   # into the spine-local render frame
         px_ap = sim._ap.project_point(pos)
         px_lat = sim._lat.project_point(pos)
         in_ap = px_ap is not None
         in_lat = px_lat is not None
         n_in_ap += in_ap
         n_in_lat += in_lat
-        print(f"  {b['label']:<14} world={tuple(pos.round(1))}  "
+        print(f"  {b['label']:<14} render={tuple(pos.round(1))}  "
               f"AP={'in-frame ' + str(px_ap) if in_ap else 'OFF-FRAME'}  "
               f"LAT={'in-frame ' + str(px_lat) if in_lat else 'OFF-FRAME'}")
 
@@ -142,17 +203,30 @@ def main() -> int:
     print(f"\n{n_in_ap}/{len(cfg.BEARING_POSITIONS)} bearings in-frame on AP, "
           f"{n_in_lat}/{len(cfg.BEARING_POSITIONS)} on LAT "
           f"(detector {npix[0]}x{npix[1]} px)")
+    fov_mm = npix[0] * cfg.GVXR_PIXEL_SIZE_MM
     print(f"\nSaved: {ap_path}")
     print(f"Saved: {lat_path}")
+    print(f"Saved: {ap_annot_path}   <- green labelled bearing rings")
+    print(f"Saved: {lat_annot_path}  <- green labelled bearing rings")
+
+    print(f"\nNote: the detector covers only ~{fov_mm:.0f} x {fov_mm:.0f} mm "
+          f"({npix[0]}px x {cfg.GVXR_PIXEL_SIZE_MM} mm/px), centred on the "
+          f"spine. The bearings are pressed into the PLATFORM walls, which span "
+          f"a much wider footprint than that -- so most of them physically "
+          f"cannot appear in frame. Few/no bearings visible is EXPECTED here and "
+          f"is not evidence of a registration error.")
 
     if n_in_ap < len(cfg.BEARING_POSITIONS) or n_in_lat < len(cfg.BEARING_POSITIONS):
-        print("\n[WARNING] Not all bearings are in-frame on both views.")
-        print("This does NOT necessarily mean SPINE_TO_WORLD/BOARD_TO_WORLD are")
-        print("wrong -- GVXR_ISOCENTER may just need centring on your actual")
-        print("bearing cluster. Check the printed world-space bbox above.")
+        print("\n[INFO] Not all bearings are in-frame on both views (see note above).")
 
-    print("\nOpen both PNGs and check the criteria described in this script's")
-    print("module docstring before moving on to camera/board/probe testing.")
+    print("\nWhat to check in the *_bearings.png images:")
+    print("  For any bearing that IS in frame, the green ring (analytic")
+    print("  projection of its CAD position) should sit directly on top of the")
+    print("  small bright dot (gVXR's ray-cast through the actual sphere mesh).")
+    print("  Coincident  -> transform chain and projection maths agree.")
+    print("  Offset      -> the pixel gap is your registration error readout.")
+    print("\nThe decisive end-to-end test is still the probe: put it in the")
+    print("platform hole and use the Snapshot button in main.py.")
     return 0
 
 

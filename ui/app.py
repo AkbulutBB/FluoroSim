@@ -49,7 +49,11 @@ class FluoroSimApp:
 
         self._board_tracker = BoardTracker()
         self._probe_tracker = ProbeTracker()
-        self._nav  = NavigationEngine(cfg.BOARD_TO_WORLD)
+        # BOARD_TO_SPINE, not BOARD_TO_WORLD: the gVXR render frame is
+        # spine-local (see config.py's derived-transforms section). FusedPose's
+        # .tip_world / .base_world are therefore points in the RENDER frame,
+        # which is exactly what render_snapshot_with_probe() expects.
+        self._nav  = NavigationEngine(cfg.BOARD_TO_SPINE)
         self._sim  = XRaySimulator(cfg)
 
         self._ap_bg:  Optional[np.ndarray] = None
@@ -173,7 +177,7 @@ class FluoroSimApp:
     def _on_render_bg(self):
         if not GVXR_AVAILABLE:
             return
-        self._status.set("Rendering synthetic X-ray background…")
+        self._status.set("Loading synthetic X-ray background…")
         self._root.update_idletasks()
         if not self._sim_ready:
             if not self._sim.initialise():
@@ -181,7 +185,15 @@ class FluoroSimApp:
                 self._status.set("X-ray init failed.")
                 return
             self._sim_ready = True
-        self._ap_bg, self._lat_bg = self._sim.render_background()
+
+        # Cache-first: if the launcher already prepared this configuration the
+        # images load from disk instantly and no GPU render happens at all.
+        self._ap_bg, self._lat_bg = self._sim.load_cached_background()
+        if self._ap_bg is None:
+            self._status.set("Rendering synthetic X-ray background (first time)…")
+            self._root.update_idletasks()
+            self._ap_bg, self._lat_bg = self._sim.render_background()
+
         if self._ap_bg is None:
             self._status.set("Render failed.")
             return
@@ -308,4 +320,10 @@ class FluoroSimApp:
         self._on_stop()
         if self._sim_ready:
             self._sim.shutdown()
+        # True process exit: now it is safe to tear down the process-wide
+        # gVXR OpenGL context (it cannot be recreated afterwards).
+        try:
+            XRaySimulator.destroy_context()
+        except Exception:
+            pass
         self._root.destroy()

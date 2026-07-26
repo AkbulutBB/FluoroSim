@@ -103,9 +103,10 @@ class LauncherWindow:
         body.pack(fill=tk.BOTH, expand=True, padx=14, pady=8)
 
         self._row_gvxr = StepRow(
-            body, 1, "Verify X-ray engine (gVXR)",
-            "Render a synthetic test image to confirm the GPU context works.",
-            "Verify", self._do_verify_gvxr)
+            body, 1, "Prepare X-ray background",
+            "Verify the GPU context and pre-render the AP + lateral background "
+            "(cached, so navigation starts instantly).",
+            "Prepare", self._do_verify_gvxr)
 
         self._row_cams = StepRow(
             body, 2, "Detect cameras",
@@ -163,7 +164,7 @@ class LauncherWindow:
     # ── Step 1: gVXR ──────────────────────────────────────────────────
 
     def _do_verify_gvxr(self):
-        self._row_gvxr.set_status("warn", "Rendering test image…")
+        self._row_gvxr.set_status("warn", "Preparing X-ray background…")
         self._root.update_idletasks()
 
         def work():
@@ -174,12 +175,24 @@ class LauncherWindow:
                 return
             sim = XRaySimulator(cfg)
             ok = sim.initialise()
+            cached = False
             if ok:
-                ap, _ = sim.render_background()
+                # Reuse an already-prepared background if the configuration
+                # hasn't changed, otherwise render once and cache it to disk.
+                ap, _ = sim.load_cached_background()
+                cached = ap is not None
+                if ap is None:
+                    ap, _ = sim.render_background()
                 ok = ap is not None and ap.max() > 0
+            # NOTE: deliberately no context teardown here. gVXR allows one
+            # OpenGL context per process and cannot recreate it, so destroying
+            # it would break the navigation window that opens next.
             sim.shutdown()
-            msg = ("X-ray engine OK — GPU context verified."
-                   if ok else "gVXR failed to render — see console log.")
+            if ok:
+                msg = ("X-ray background ready (loaded from cache)." if cached
+                       else "X-ray background rendered and cached.")
+            else:
+                msg = "gVXR failed to render — see console log."
             self._root.after(0, lambda: self._row_gvxr.set_status(
                 "ok" if ok else "bad", msg))
 
