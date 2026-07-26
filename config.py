@@ -13,7 +13,8 @@ values from your Fusion 360 assembly.  Everything else works as-is.
        models/platform.stl   (optional)
 
 2. Fill in BEARING_POSITIONS from Fusion assembly coordinates.
-3. Fill in SPINE_ORIGIN_IN_WORLD (spine hard-stop position in platform frame).
+3. Fill in SPINE_TO_WORLD (spine local->platform rigid transform, rotation
+   included -- do NOT assume translation-only; see derivation notes below).
 4. Fill in BOARD_TO_WORLD (ChArUco board origin + orientation in platform frame).
 5. Run tools/test_gvxr.py — confirm "ALL TESTS PASSED".
 6. Run main.py.
@@ -144,7 +145,8 @@ SPINE_TRABECULAR_DENSITY  = 0.35               # g/cm³  (was 0.2)
 
 # Virtual C-arm geometry (mm, gVXR world = CAD platform space).
 #
-# Views are FIXED in the board frame (BOARD_TO_WORLD = identity for now), and
+# Views are FIXED in the board frame (BOARD_TO_WORLD is now a real 90 deg
+# axis-relabeling rotation + offset, solved below -- see that section), and
 # defined by a BEAM DIRECTION (direction X-rays travel) plus a shared isocentre.
 #
 # Board frame (OpenCV ChArUco convention):
@@ -212,22 +214,55 @@ GVXR_PHOTON_COUNT = 5000    # was 1000; higher = less Monte Carlo graininess, sl
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Position of each steel ball bearing centre in gVXR world (= CAD platform) space.
-# X, Y, Z in mm relative to platform origin.  Replace with your actual Fusion values.
+# X, Y, Z in mm relative to platform origin.
+#
+# Solved via Kabsch/SVD fit of 8 measured bearing correspondences + the
+# ChArUco board's own origin corner as a 9th point (see BOARD_TO_WORLD below
+# for the same fit) -- RMS residual 0.000 mm, i.e. these are exact CAD design
+# values, not yet field-validated against a live camera reading.
+# ASSUMPTION FLAGGED: point-order 1-7 assumed to match physical bearing
+# labels B1-B7 in the order originally measured; re-check against physical
+# labels before trusting the reprojection-error validation step.
 BEARING_POSITIONS = [
-    {"label": "B1",            "position_mm": ( 30.0,  5.0,  20.0), "radius_mm": 1.5},
-    {"label": "B2",            "position_mm": (-30.0,  5.0,  20.0), "radius_mm": 1.5},
-    {"label": "B3",            "position_mm": (  0.0,  5.0,  20.0), "radius_mm": 1.5},
-    {"label": "B4",            "position_mm": ( 30.0,  5.0, -20.0), "radius_mm": 1.5},
-    {"label": "B5",            "position_mm": (-30.0,  5.0, -20.0), "radius_mm": 1.5},
-    {"label": "B6",            "position_mm": (  0.0,  5.0, -20.0), "radius_mm": 1.5},
-    {"label": "B7",            "position_mm": ( 15.0,  5.0,   0.0), "radius_mm": 1.5},
-    {"label": "B8_probe_tip",  "position_mm": (  0.0, 20.0,   0.0), "radius_mm": 1.5},
+    {"label": "B1",            "position_mm": (-64.00, -70.50,  78.50), "radius_mm": 1.5},
+    {"label": "B2",            "position_mm": ( 35.00, -67.00,  78.50), "radius_mm": 1.5},
+    {"label": "B3",            "position_mm": ( 45.00, -74.00,  78.50), "radius_mm": 1.5},
+    {"label": "B4",            "position_mm": ( 55.00, -70.50,  78.50), "radius_mm": 1.5},
+    {"label": "B5",            "position_mm": ( 35.25,  60.50,  58.00), "radius_mm": 1.5},
+    {"label": "B6",            "position_mm": (-25.50,  60.50,  35.00), "radius_mm": 1.5},
+    {"label": "B7",            "position_mm": (-64.25,  60.50,  12.50), "radius_mm": 1.5},
+    {"label": "B8_probe_tip",  "position_mm": (-77.00,  -8.00,  38.50), "radius_mm": 1.5},
 ]
 
-# Spine model origin in gVXR world space — the seated hard-stop position.
-# Read from Fusion: coordinates of the spine component origin relative to
-# the platform assembly origin when fully slid in.
-SPINE_ORIGIN_IN_WORLD = (0.0, 0.0, 0.0)   # ← FROM CAD
+# Spine STL local frame -> gVXR world (CAD platform) frame. Rigid 4x4,
+# rotation included -- do NOT assume translation-only (an earlier version of
+# this comment did; that was wrong).
+#
+# Solved from two local<->world corner correspondences on the spine's bottom
+# plate:
+#   A = cranial-right corner (genuine hard-stop, "locks in" against the
+#       platform): local (-23.64995, 0.78463, 33.90369) <-> world (-69, 30, -6)
+#   C = right-caudal corner (X/Z from real Fusion sketch geometry; Y carried
+#       over from A since there is no caudal hard-stop -- least-trusted axis):
+#       local (-23.29325, 0.88218, -47.59369) <-> world (12.50, 30.00, -6.00)
+# Point C predicted from A's fit to within (0.003, 0.357, 0.098) mm -- the
+# rotation is confirmed, not assumed. It also happens to equal BOARD_TO_WORLD's
+# rotation exactly, consistent with both components sharing one Fusion
+# local-axis convention.
+#
+# NOT yet used to predict the left-cranial corner's true seated position
+# (predicts ~(-69.3, -32.6, -5.4), i.e. more slack there than the plate's
+# nominal 5mm-each-side clearance) -- harmless for rendering, just flagging
+# the plate isn't symmetric in its slot.
+#
+# Re-derive with tools/solve_board_to_world.py-style Kabsch fit (ideally with
+# a 3rd non-collinear point) if the spine STL or platform mount ever changes.
+SPINE_TO_WORLD = np.array([
+    [ 0.0,  0.0, -1.0, -35.0963],
+    [-1.0,  0.0,  0.0,   6.3500],
+    [ 0.0,  1.0,  0.0,  -6.7846],
+    [ 0.0,  0.0,  0.0,   1.0000],
+], dtype=np.float64)
 
 # ChArUco board → gVXR world transform  (4×4, row-major rigid matrix).
 # This tells the system where the board origin sits in platform/world space.
@@ -241,13 +276,19 @@ SPINE_ORIGIN_IN_WORLD = (0.0, 0.0, 0.0)   # ← FROM CAD
 #   4. If the board is rotated, use Component Properties to read the local
 #      axis directions and build the 3×3 rotation part.
 #
-# Default = identity + zero offset (board at platform origin, same orientation).
-# Replace with your actual measured values.
+# Solved via Kabsch/SVD fit over 8 fiducial correspondences + the board's own
+# origin corner (CAD -86, 53, 71). Fit converged to an EXACT signed-permutation
+# rotation (RMS residual 0.000 mm across all 9 points) -- a pure 90 deg axis
+# relabeling, no tilt component:
+#     world_X =  board_Z
+#     world_Y = -board_X
+#     world_Z = -board_Y
+# Re-derive if the platform/board mount geometry ever changes.
 BOARD_TO_WORLD = np.array([
-    [1.0, 0.0, 0.0,   0.0],   # ← tx: board origin X in platform space (mm)
-    [0.0, 1.0, 0.0,   0.0],   # ← ty: board origin Y
-    [0.0, 0.0, 1.0,   0.0],   # ← tz: board origin Z
-    [0.0, 0.0, 0.0,   1.0],
+    [ 0.0,  0.0,  1.0, -86.0],
+    [-1.0,  0.0,  0.0,  53.0],
+    [ 0.0, -1.0,  0.0,  71.0],
+    [ 0.0,  0.0,  0.0,   1.0],
 ], dtype=np.float64)
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -13,7 +13,7 @@ Requirements:
 
 Before first run:
     Fill in the CAD values in config.py (BEARING_POSITIONS,
-    SPINE_ORIGIN_IN_WORLD, BOARD_TO_WORLD, STL paths). Everything else
+    SPINE_TO_WORLD, BOARD_TO_WORLD, STL paths). Everything else
     is handled by the on-screen setup steps.
 """
 

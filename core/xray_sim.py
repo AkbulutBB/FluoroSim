@@ -32,7 +32,9 @@ Coordinate chain (zero physical calibration required)
     ChArUco board frame
         ↓  BOARD_TO_WORLD  (4×4 rigid from CAD — set in config.py)
     gVXR world = CAD platform origin
-        ↓  SPINE_ORIGIN_IN_WORLD  (3-vector, hard-stop position from CAD)
+        ↓  SPINE_TO_WORLD  (4×4 rigid from CAD — set in config.py; the spine
+        ↓                   STL's local axes are NOT world-aligned, rotation
+        ↓                   confirmed via two independent corner fits)
     Spine STL local frame
 """
 
@@ -59,6 +61,58 @@ except ImportError:
         "gvxrPython3 not found — synthetic X-ray disabled.\n"
         "Install with:  pip install gvxr"
     )
+
+
+def _axis_angle_from_matrix(R: np.ndarray) -> Tuple[float, np.ndarray]:
+    """
+    Convert a 3x3 proper rotation matrix (det=+1) to (angle_degrees, axis).
+    General Rodrigues-formula inversion, handles the near-identity and
+    near-180-degree edge cases (both degenerate in the naive formula).
+    """
+    R = np.asarray(R, dtype=np.float64)
+    cos_theta = np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0)
+    theta = float(np.arccos(cos_theta))
+
+    if theta < 1e-8:
+        return 0.0, np.array([0.0, 0.0, 1.0])  # no rotation; axis arbitrary
+
+    if theta > np.pi - 1e-6:
+        # Near 180 deg: off-diagonal formula is ill-conditioned. Extract the
+        # axis from the symmetric part instead (eigenvector for eigenvalue +1).
+        A = (R + np.eye(3)) / 2.0
+        axis = np.sqrt(np.clip(np.diag(A), 0.0, None))
+        # Fix signs using the off-diagonal terms
+        if axis[0] > 1e-8:
+            axis[1] *= np.sign(A[0, 1])
+            axis[2] *= np.sign(A[0, 2])
+        elif axis[1] > 1e-8:
+            axis[2] *= np.sign(A[1, 2])
+        return float(np.degrees(theta)), axis / np.linalg.norm(axis)
+
+    axis = np.array([
+        R[2, 1] - R[1, 2],
+        R[0, 2] - R[2, 0],
+        R[1, 0] - R[0, 1],
+    ]) / (2.0 * np.sin(theta))
+    return float(np.degrees(theta)), axis
+
+
+def _place_node_rigid(label: str, T: np.ndarray):
+    """
+    Apply a full 4x4 rigid transform (local -> world) to an already-created
+    gVXR node, via rotateNode (about the node's local origin) followed by
+    translateNode. Mirrors the order already used for the K-wire cylinder
+    in render_snapshot_with_probe(), which is the order gVXR expects:
+    rotation is applied first (about local origin), then the translation
+    places the rotated node at its final world position.
+    """
+    T = np.asarray(T, dtype=np.float64).reshape(4, 4)
+    R = T[:3, :3]
+    t = T[:3, 3]
+    angle_deg, axis = _axis_angle_from_matrix(R)
+    if abs(angle_deg) > 1e-6:
+        _gvxr.rotateNode(label, angle_deg, *axis)
+    _gvxr.translateNode(label, *[float(v) for v in t], "mm")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -305,9 +359,11 @@ class XRaySimulator:
             _gvxr.setDensity ("spine_core", getattr(
                 cfg, 'SPINE_TRABECULAR_DENSITY', 0.2), "g/cm3")
 
-            ox, oy, oz = (float(v) for v in cfg.SPINE_ORIGIN_IN_WORLD)
-            _gvxr.translateNode("spine_shell", ox, oy, oz, "mm")
-            _gvxr.translateNode("spine_core",  ox, oy, oz, "mm")
+            spine_to_world = np.asarray(
+                getattr(cfg, "SPINE_TO_WORLD", np.eye(4)), dtype=np.float64
+            ).reshape(4, 4)
+            _place_node_rigid("spine_shell", spine_to_world)
+            _place_node_rigid("spine_core",  spine_to_world)
             self._registered_meshes.append("spine_shell")
             self._registered_meshes.append("spine_core")
             logger.info("Loaded spine as shell+core: %s / %s", shell_path, core_path)
@@ -325,9 +381,15 @@ class XRaySimulator:
             _gvxr.setCompound("spine", cfg.SPINE_MATERIAL_COMPOUND)
             _gvxr.setDensity ("spine", cfg.SPINE_MATERIAL_DENSITY, "g/cm3")
 
-            # Translate to hard-stop seated position (from CAD)
-            ox, oy, oz = (float(v) for v in cfg.SPINE_ORIGIN_IN_WORLD)
-            _gvxr.translateNode("spine", ox, oy, oz, "mm")
+            # Seat at the hard-stop position (from CAD) -- full rigid
+            # transform, NOT translation-only: the spine STL's local axes
+            # are rotated 120 deg about (1,-1,-1)/sqrt(3) relative to gVXR
+            # world/CAD space (confirmed via two independent corner
+            # correspondences, see SPINE_TO_WORLD derivation in config.py).
+            spine_to_world = np.asarray(
+                getattr(cfg, "SPINE_TO_WORLD", np.eye(4)), dtype=np.float64
+            ).reshape(4, 4)
+            _place_node_rigid("spine", spine_to_world)
             self._registered_meshes.append("spine")
 
         # ── Platform STL (optional) ────────────────────────────────────

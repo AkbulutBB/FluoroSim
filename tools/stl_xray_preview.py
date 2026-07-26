@@ -15,7 +15,8 @@ works, the rendering core of the real pipeline works.
 
 The isocentre is auto-computed from the CLIPPED mesh's own bounding-box
 centre, so this tool has no dependency on BOARD_TO_WORLD or
-SPINE_ORIGIN_IN_WORLD, both of which are still placeholders. Good enough
+SPINE_TO_WORLD (now both real, solved values -- see config.py), since a
+single-STL preview by definition isn't registered to anything. Good enough
 for "does the geometry/density look right" — not for registration.
 
 Usage
@@ -524,7 +525,7 @@ def build_preview_cfg(
         SPINE_MATERIAL_DENSITY=density,
         SPINE_TRABECULAR_COMPOUND=trabecular_compound,
         SPINE_TRABECULAR_DENSITY=trabecular_density,
-        SPINE_ORIGIN_IN_WORLD=(0.0, 0.0, 0.0),
+        SPINE_TO_WORLD=np.eye(4),
         BEARING_POSITIONS=[],
         GVXR_ISOCENTER=tuple(float(v) for v in isocenter_local),
         GVXR_SOD_MM=sod_mm,
